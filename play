@@ -1,0 +1,3 @@
+#!/bin/bash
+source /etc/profile
+liquidsoap 'output.icecast(%mp3, host = "192.168.0.200", port = 7777, user="source", password="listen", mount = "/audio", mksafe(playlist("/srv/audio/favorites.pls")))'

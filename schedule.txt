@@ -1,0 +1,8 @@
+# Radio Schedule
+# Format: min hour dom mon dow TYPE TARGET [RUNLENGTH_SECONDS]
+# TYPE: show | stream
+# RUNLENGTH required for stream entries, ignored for show entries
+#
+# Examples:
+# 0 8 * * 2     show    hardcore_history
+# 0 6 * * 1     stream  http://example.org:8000/live.mp3   3600
