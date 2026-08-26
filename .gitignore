@@ -1,0 +1,37 @@
+# Local Ruby gems (installed by install_for_jruby)
+.gems/
+
+# Python virtualenv
+.venv/
+
+# Runtime state: SQLite DBs and journals
+state/
+*.db
+*.db-journal
+*.sqlite3
+*.sqlite3-journal
+
+# Logs
+logs/
+*.log
+
+# Large / regenerable media directories
+music/
+podcasts/
+jingles/
+announcements/
+
+# Generated playlist files
+playlists/
+*.pls
+
+# Secrets
+config.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

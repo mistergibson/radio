@@ -1,459 +1,394 @@
 #!/usr/bin/env python3
-"""Fetch podcast episodes from RSS feeds, manage subscriptions, and download audio."""
+"""
+fetch_podcasts.py - Podcast subscription management and episode fetching
+for the liquidsoap radio automation stack.
+"""
 
-import os
-import sys
+import argparse
 import json
+import logging
+import re
 import shutil
 import sqlite3
-import hashlib
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import quote
 
 import feedparser
 import requests
 
-AUDIO_ROOT = Path(__file__).resolve().parent
-DB_PATH = AUDIO_ROOT / "state" / "subscriptions.db"
-DOWNLOAD_DIR = AUDIO_ROOT / "podcasts"
-CONFIG_PATH = AUDIO_ROOT / "config.json"
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / "config.json"
+STATE_DIR = ROOT / "state"
+SUBS_DB = STATE_DIR / "subscriptions.db"
+PLAYED_DB = STATE_DIR / "played.db"
+PODCASTS_DIR = ROOT / "podcasts"
+LOGS_DIR = ROOT / "logs"
 
+AUDIO_EXTS = {".mp3", ".m4a"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOGS_DIR / "fetch.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("fetch_podcasts")
+
+def log_error(msg):
+    log.error(msg)
 
 def load_config():
-    with open(CONFIG_PATH, "r") as f:
+    with open(CONFIG_PATH) as f:
         return json.load(f)
 
-
-def get_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""CREATE TABLE IF NOT EXISTS shows (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        feed_url TEXT UNIQUE NOT NULL,
-        slug TEXT UNIQUE NOT NULL,
-        opml_import INTEGER DEFAULT 0
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS seen (
-        url TEXT PRIMARY KEY,
-        title TEXT,
-        show_slug TEXT,
-        duration_sec INTEGER DEFAULT 0,
-        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    # Migrate existing databases that lack the new column
-    cols = [row[1] for row in conn.execute("PRAGMA table_info(shows)").fetchall()]
-    if "opml_import" not in cols:
-        conn.execute("ALTER TABLE shows ADD COLUMN opml_import INTEGER DEFAULT 0")
+def open_subs_db():
+    conn = sqlite3.connect(SUBS_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS shows (
+            slug TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            feed_url TEXT NOT NULL UNIQUE,
+            source TEXT DEFAULT 'manual',
+            opml_import INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     conn.commit()
     return conn
 
+def open_played_db():
+    conn = sqlite3.connect(PLAYED_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            show_slug TEXT NOT NULL,
+            guid TEXT NOT NULL,
+            title TEXT,
+            file_path TEXT,
+            duration_seconds INTEGER,
+            played_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(show_slug, guid)
+        )
+    """)
+    conn.commit()
+    return conn
 
-def sanitize_slug(name):
-    """Convert a show name to a filesystem-safe slug."""
-    slug = name.lower().strip()
-    slug = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in slug)
-    slug = "_".join(slug.split("_"))
-    return slug[:80]
+def slugify(name):
+    s = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return s[:60] or "show"
 
+def gpodder_sync(cfg):
+    g = cfg["gpodder"]
+    base = g["host"].rstrip("/")
+    username = g["username"]
+    password = g["password"]
+    url = f"{base}/subscriptions/{quote(username, safe='')}.opml"
 
-def register_shows_from_opml_xml(xml_bytes, db, opml_import=False):
-    """Register shows from OPML XML data.
+    print(f"--- Syncing subscriptions from {base} ---")
+    print(f"Fetching subscriptions for '{username}'...")
 
-    Uses upsert semantics: if a show with the same feed_url already exists,
-    no duplicate row is created. Its opml_import flag is upgraded to 1 if
-    this import marks it as such (protecting it from gpodder pruning).
-    """
-    root = ET.fromstring(xml_bytes)
-    added = 0
-    updated_flag = 0
-    skipped = 0
+    resp = requests.get(
+        url,
+        auth=(username, password),
+        headers={"User-Agent": "radio-automation/1.0"},
+        timeout=60,
+    )
 
+    if resp.status_code == 200:
+        body = resp.text
+        if not body.strip():
+            log_error("gPodder sync returned an empty body.")
+            return []
+        return parse_opml(body)
+    elif resp.status_code == 401:
+        log_error("gPodder sync failed: 401 Unauthorized. Check username/password in config.json.")
+    elif resp.status_code == 404:
+        log_error("gPodder sync failed: 404 Not Found. User may not exist or has no subscriptions.")
+    elif resp.status_code == 400:
+        log_error("gPodder sync failed: 400 Bad Request.")
+    else:
+        log_error(f"gPodder sync failed: unexpected response {resp.status_code}: {resp.text[:200]}")
+    return []
+
+def parse_opml(xml_string):
+    shows = []
+    try:
+        root = ET.fromstring(xml_string)
+    except ET.ParseError as e:
+        log_error(f"Failed to parse OPML XML: {e}")
+        return []
     for outline in root.iter("outline"):
-        xml_url = outline.get("xmlUrl", "")
-        if not xml_url:
+        feed_url = (outline.attrib.get("xmlUrl") or "").strip()
+        name = (outline.attrib.get("text") or "").strip()
+        if not feed_url or not re.match(r"^https?://", feed_url):
             continue
-        otype = outline.get("type", "")
-        if otype and otype != "rss":
-            continue
+        shows.append({"name": name, "feed_url": feed_url})
+    return shows
 
-        show_name = outline.get("text") or outline.get("title") or "Unknown Show"
-        slug = sanitize_slug(show_name)
-        flag = 1 if opml_import else 0
-
-        existing = db.execute(
-            "SELECT id, opml_import FROM shows WHERE feed_url=?", (xml_url,)
-        ).fetchone()
-
-        if existing:
-            existing_id, existing_flag = existing
-            if flag == 1 and existing_flag == 0:
-                db.execute(
-                    "UPDATE shows SET opml_import=1 WHERE id=?", (existing_id,)
-                )
-                updated_flag += 1
-                print(f"  Protected existing: {show_name} ({slug})")
-            else:
-                skipped += 1
-        else:
+def register_remote_shows(remote_shows):
+    db = open_subs_db()
+    added = 0
+    for show in remote_shows:
+        slug = slugify(show["name"])
+        existing = db.execute("SELECT slug FROM shows WHERE slug = ?", (slug,)).fetchone()
+        if existing is None:
             db.execute(
-                "INSERT INTO shows (name, feed_url, slug, opml_import) VALUES (?, ?, ?, ?)",
-                (show_name, xml_url, slug, flag)
+                "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
+                (slug, show["name"], show["feed_url"]),
             )
+            log.info("Registered new show: %s (%s)", show["name"], slug)
             added += 1
-            print(f"  Registered: {show_name} -> {slug}")
-
     db.commit()
-
-    if added:
-        print(f"  Added {added} new show(s).")
-    if updated_flag:
-        print(f"  Upgraded {updated_flag} show(s) to protected.")
-    if skipped:
-        print(f"  Skipped {skipped} duplicate(s).")
+    db.close()
     return added
 
-
-def import_opml_file(filepath):
-    """Import shows from a local OPML file."""
-    try:
-        with open(filepath, "rb") as f:
-            xml_data = f.read()
-    except FileNotFoundError:
-        print(f"ERROR: File not found: {filepath}")
-        sys.exit(1)
-
-    db = get_db()
-    count = register_shows_from_opml_xml(xml_data, db, opml_import=True)
-    total = db.execute("SELECT COUNT(*) FROM shows").fetchone()[0]
-    db.close()
-
-    print(f"\nImport complete. {count} new show(s) added. Total registered: {total}")
-
-
-def sync_gpoddernet():
-    """Sync subscriptions from gpodder.net, register new shows, prune removed ones."""
-    cfg = load_config()
-    gp = cfg["gpodder"]
-
-    if not gp.get("enable", False):
-        print("gpodder.net sync is disabled in config.json.")
-        return
-
-    if not gp.get("username") or not gp.get("password"):
-        print("ERROR: gpodder.username/gpodder.password not set in config.json")
-        sys.exit(1)
-
-    url = f"{gp['host']}/subscriptions/{gp['username']}.opml"
-    print(f"Fetching subscriptions from {gp['host']} for '{gp['username']}'...")
-
-    resp = requests.get(url, auth=(gp["username"], gp["password"]), timeout=30)
-
-    if resp.status_code == 401:
-        print("ERROR: Authentication failed. Check username/password in config.json.")
-        sys.exit(1)
-    elif resp.status_code != 200:
-        print(f"ERROR: Unexpected response {resp.status_code}: {resp.text[:200]}")
-        sys.exit(1)
-
-    db = get_db()
-
-    # Collect all feed URLs from the current subscription list
-    root = ET.fromstring(resp.content)
-    gp_feed_urls = set()
-    for outline in root.iter("outline"):
-        fu = outline.get("xmlUrl", "")
-        if fu:
-            gp_feed_urls.add(fu)
-
-    # Register any new shows
-    count = register_shows_from_opml_xml(resp.content, db, opml_import=False)
-    total = db.execute("SELECT COUNT(*) FROM shows").fetchone()[0]
-
-    # Prune shows that were unsubscribed
-    prune_removed_shows(gp_feed_urls, db)
-
-    db.close()
-    print(f"\nSync complete. {count} new, total registered: {total}")
-
-
-def prune_removed_shows(gp_feed_urls, db):
-    """Remove shows not in current gpodder list (unless opml_import=1)."""
-    rows = db.execute(
-        "SELECT slug, feed_url, name FROM shows WHERE opml_import = 0"
+def prune_stale_shows(remote_shows):
+    db = open_subs_db()
+    remote_slugs = {slugify(s["name"]) for s in remote_shows}
+    stale = db.execute(
+        "SELECT slug, name FROM shows WHERE source = 'gpodder' AND opml_import = 0"
     ).fetchall()
-
-    to_remove = []
-    for slug, feed_url, name in rows:
-        if feed_url not in gp_feed_urls:
-            to_remove.append((slug, name))
-
-    if not to_remove:
-        return
-
-    for slug, name in to_remove:
-        print(f"  Removing unsubscribed show: {name} ({slug})")
-        db.execute("DELETE FROM seen WHERE show_slug=?", (slug,))
-        db.execute("DELETE FROM shows WHERE slug=?", (slug))
-        show_dir = DOWNLOAD_DIR / slug
-        if show_dir.exists():
-            shutil.rmtree(show_dir)
-            print(f"  Deleted directory: {show_dir}")
-
-    db.commit()
-    print(f"  Pruned {len(to_remove)} removed show(s).")
-
-
-def delete_show(slug):
-    """Manually delete a show and all associated data."""
-    db = get_db()
-    row = db.execute("SELECT name FROM shows WHERE slug=?", (slug,)).fetchone()
-    if not row:
-        print(f"No show found with slug '{slug}'.")
-        db.close()
-        return
-
-    name = row[0]
-    print(f"Deleting show: {name} ({slug})")
-    db.execute("DELETE FROM seen WHERE show_slug=?", (slug,))
-    db.execute("DELETE FROM shows WHERE slug=?", (slug))
+    removed = 0
+    for row in stale:
+        if row["slug"] not in remote_slugs:
+            remove_show_data(row["slug"])
+            db.execute("DELETE FROM shows WHERE slug = ?", (row["slug"],))
+            log.info("Pruned stale show: %s (%s)", row["name"], row["slug"])
+            removed += 1
     db.commit()
     db.close()
+    return removed
 
-    show_dir = DOWNLOAD_DIR / slug
-    if show_dir.exists():
-        shutil.rmtree(show_dir)
-        print(f"Deleted directory: {show_dir}")
-
-    pls_file = AUDIO_ROOT / "playlists" / f"{slug}.pls"
-    if pls_file.exists():
-        pls_file.unlink()
-        print(f"Deleted playlist: {pls_file}")
-
-    print("Done.")
-
-
-def add_show(feed_url):
-    """Register a new show from a feed URL and fetch its initial episodes."""
-    print(f"Fetching feed: {feed_url}")
-    try:
-        d = feedparser.parse(feed_url)
-    except Exception as e:
-        print(f"ERROR: Failed to parse feed: {e}")
-        sys.exit(1)
-
-    if d.bozo and not d.entries:
-        print(f"ERROR: Invalid or unreachable feed. Bozo exception: {d.get('bozo_exception', 'unknown')}")
-        sys.exit(1)
-
-    show_name = d.feed.get("title", "Unknown Show")
-    slug = sanitize_slug(show_name)
-    entry_count = len(d.entries)
-
-    print(f"  Title: {show_name}")
-    print(f"  Slug:  {slug}")
-    print(f"  Entries found: {entry_count}")
-
-    db = get_db()
-
-    existing = db.execute("SELECT name FROM shows WHERE feed_url=?", (feed_url,)).fetchone()
-    if existing:
-        print(f"NOTE: Feed already registered as '{existing[0]}'. Nothing to do.")
-        db.close()
-        return
-
-    db.execute(
-        "INSERT INTO shows (name, feed_url, slug, opml_import) VALUES (?, ?, ?, 1)",
-        (show_name, feed_url, slug)
-    )
-    db.commit()
-    print(f"  Registered: {show_name} -> {slug}")
-
-    print(f"\n--- Fetching episodes ---")
-    fetch_feed(show_name, feed_url, slug, db)
-
-    db.close()
-    print(f"\nDone. Episodes saved to: {DOWNLOAD_DIR / slug}/")
-
-
-def fetch_feed(show_name, feed_url, slug, db):
-    """Parse a feed and download any new episodes."""
-    d = feedparser.parse(feed_url)
-
-    if d.bozo and not d.entries:
-        print(f"[{show_name}] ERROR: Could not parse feed.")
-        return
-
-    show_dir = DOWNLOAD_DIR / slug
-    show_dir.mkdir(parents=True, exist_ok=True)
-
-    new_count = 0
-    for entry in d.entries:
-        link = entry.get("link", "")
-        title = entry.get("title", "untitled")
-
-        # Find the enclosure (audio file)
-        enclosure = None
-        if hasattr(entry, "enclosures") and entry.enclosures:
-            enc = entry.enclosures[0]
-            enclosure = {"url": enc.href, "type": enc.type, "length": getattr(enc, "length", "0")}
-        elif "media_content" in entry:
-            mc = entry.media_content[0]
-            enclosure = {"url": mc.url, "type": mc.type, "length": getattr(mc, "duration", "0")}
-
-        if not enclosure:
-            continue
-
-        ep_url = enclosure["url"]
-
-        # Check if already downloaded
-        row = db.execute("SELECT 1 FROM seen WHERE url=?", (ep_url,)).fetchone()
-        if row:
-            continue
-
-        # Extract duration from enclosure length (seconds) or media:duration
-        duration_sec = 0
+def extract_duration(entry):
+    dur = entry.get("media_duration") or entry.get("duration")
+    if dur:
         try:
-            raw_len = str(enclosure.get("length", "0"))
-            if ":" in raw_len:
-                parts = raw_len.split(":")
-                duration_sec = int(parts[-1])
-            else:
-                duration_sec = int(raw_len)
-        except (ValueError, IndexError):
+            return int(float(dur))
+        except (ValueError, TypeError):
             pass
+    iso = entry.get("iso_8601_duration")
+    if iso:
+        m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso)
+        if m:
+            h, mn, s = (int(g) if g else 0 for g in m.groups())
+            return h * 3600 + mn * 60 + s
+    enclosures = entry.get("enclosures") or []
+    if enclosures:
+        length = enclosures[0].get("length")
+        if length:
+            try:
+                return int(int(length) * 8 / 128000)
+            except ValueError:
+                pass
+    return None
 
-        # Sanitize filename
-        safe_title = "".join(c if c.isalnum() or c in ("-", "_", " ") else "_" for c in title)
-        safe_title = safe_title.strip()[:120]
-        ext = ".mp3"
-        if "ogg" in enclosure.get("type", "").lower():
-            ext = ".ogg"
-        elif "m4a" in enclosure.get("type", "").lower() or "aac" in enclosure.get("type", "").lower():
-            ext = ".m4a"
+def fetch_feed(feed_url):
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as e:
+        log_error(f"Feed parse error for {feed_url}: {e}")
+        return None
+    if parsed.bozo and not parsed.entries:
+        log_error(f"Bozo feed (no entries) for {feed_url}: {parsed.bozo_exception}")
+        return None
+    return parsed
 
-        filepath = show_dir / f"{safe_title}{ext}"
-
-        if filepath.exists():
-            db.execute(
-                "INSERT OR IGNORE INTO seen (url, title, show_slug, duration_sec) VALUES (?, ?, ?, ?)",
-                (ep_url, title, slug, duration_sec)
-            )
-            db.commit()
-            continue
-
-        # Download
-        try:
-            print(f"[{show_name}] Downloading: {title}")
-            resp = requests.get(ep_url, stream=True, timeout=120)
-            resp.raise_for_status()
-            with open(filepath, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
+def download_episode(url, dest_dir, filename):
+    dest = dest_dir / filename
+    if dest.exists():
+        return str(dest)
+    try:
+        with requests.get(url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
+            tmp.rename(dest)
+        return str(dest)
+    except requests.RequestException as e:
+        log_error(f"Download failed for {url}: {e}")
+        return None
 
-            db.execute(
-                "INSERT OR IGNORE INTO seen (url, title, show_slug, duration_sec) VALUES (?, ?, ?, ?)",
-                (ep_url, title, slug, duration_sec)
-            )
-            db.commit()
-            new_count += 1
+def safe_filename(title, fallback):
+    name = re.sub(r"[^\w\s.-]", "", title or "").strip().replace(" ", "_")
+    return (name[:120] or fallback) + ".mp3"
+
+def fetch_show_episodes(slug, name, feed_url):
+    dest_dir = PODCASTS_DIR / slug
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    parsed = fetch_feed(feed_url)
+    if parsed is None:
+        return 0
+    played_db = open_played_db()
+    seen = {
+        row["guid"]
+        for row in played_db.execute("SELECT guid FROM episodes WHERE show_slug = ?", (slug,))
+    }
+    subs_db = open_subs_db()
+    new_count = 0
+    for entry in parsed.entries:
+        guid = entry.get("id") or entry.get("link") or entry.get("title", "")
+        if guid in seen:
+            continue
+        enclosures = entry.get("enclosures") or []
+        if not enclosures:
+            continue
+        audio_url = enclosures[0].get("href")
+        if not audio_url:
+            continue
+        title = entry.get("title", "untitled")
+        filename = safe_filename(title, guid[-20:])
+        file_path = download_episode(audio_url, dest_dir, filename)
+        if file_path is None:
+            continue
+        duration = extract_duration(entry)
+        played_db.execute(
+            "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, duration_seconds, played_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL)",
+            (slug, guid, title, file_path, duration),
+        )
+        new_count += 1
+        log.info("  New episode: %s [%s]", title, filename)
+    played_db.commit()
+    played_db.close()
+    subs_db.close()
+    return new_count
+
+def fetch_all_episodes():
+    db = open_subs_db()
+    shows = db.execute("SELECT slug, name, feed_url FROM shows ORDER BY name").fetchall()
+    db.close()
+    total_new = 0
+    for show in shows:
+        log.info("--- Fetching: %s (%s) ---", show["name"], show["slug"])
+        try:
+            n = fetch_show_episodes(show["slug"], show["name"], show["feed_url"])
+            total_new += n
         except Exception as e:
-            print(f"[{show_name}] FAILED to download '{title}': {e}")
-
-    if new_count:
-        print(f"[{show_name}] Downloaded {new_count} new episode(s).")
-    else:
-        print(f"[{show_name}] No new episodes.")
-
+            log_error(f"Unexpected error fetching {show['slug']}: {e}")
+    log.info("=== Fetch complete: %d new episode(s) ===", total_new)
 
 def list_shows(detail=False):
-    """List all registered shows."""
-    db = get_db()
-    rows = db.execute("SELECT name, slug, feed_url, opml_import FROM shows ORDER BY name").fetchall()
-
+    db = open_subs_db()
+    rows = db.execute(
+        "SELECT slug, name, feed_url, source, opml_import FROM shows ORDER BY name"
+    ).fetchall()
+    db.close()
     if not rows:
         print("No shows registered.")
-        db.close()
         return
+    print(f"{'SLUG':<30} {'PROTECTED':<10} NAME")
+    for r in rows:
+        prot = "yes" if r["opml_import"] else "no"
+        line = f"{r['slug']:<30} {prot:<10} {r['name']}"
+        if detail:
+            line += f"\n{'':<50} {r['feed_url']}"
+        print(line)
 
-    print(f"{'Show Name':<40} {'Slug':<30} {'Protected':<10}")
-    print("-" * 80)
-    for name, slug, feed_url, prot in rows:
-        prot_str = "yes" if prot else "no"
-        print(f"{name:<40} {slug:<30} {prot_str:<10}")
-
-    if detail:
-        print("\nFeed URLs:")
-        for name, slug, feed_url, prot in rows:
-            print(f"  {slug}: {feed_url}")
-
+def add_show(feed_url):
+    parsed = fetch_feed(feed_url)
+    if parsed is None or not parsed.feed.get("title"):
+        log_error(f"Could not determine show title from {feed_url}")
+        return
+    name = parsed.feed["title"]
+    slug = slugify(name)
+    db = open_subs_db()
+    db.execute(
+        "INSERT OR IGNORE INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'manual', 0)",
+        (slug, name, feed_url),
+    )
+    db.commit()
     db.close()
+    log.info("Added show: %s (%s)", name, slug)
+    fetch_show_episodes(slug, name, feed_url)
 
+def remove_show_data(slug):
+    pod_dir = PODCASTS_DIR / slug
+    if pod_dir.exists():
+        shutil.rmtree(pod_dir)
+    pls = ROOT / "playlists" / f"{slug}.pls"
+    if pls.exists():
+        pls.unlink()
+
+def delete_show(slug):
+    db = open_subs_db()
+    row = db.execute("SELECT name FROM shows WHERE slug = ?", (slug,)).fetchone()
+    if row is None:
+        log_error(f"No show found with slug '{slug}'.")
+        return
+    remove_show_data(slug)
+    db.execute("DELETE FROM shows WHERE slug = ?", (slug,))
+    db.commit()
+    db.close()
+    played_db = open_played_db()
+    played_db.execute("DELETE FROM episodes WHERE show_slug = ?", (slug,))
+    played_db.commit()
+    played_db.close()
+    log.info("Deleted show: %s (%s)", row["name"], slug)
+
+def import_opml(path):
+    try:
+        with open(path) as f:
+            content = f.read()
+    except OSError as e:
+        log_error(f"Cannot read OPML file: {e}")
+        return
+    shows = parse_opml(content)
+    db = open_subs_db()
+    for show in shows:
+        slug = slugify(show["name"])
+        db.execute(
+            "INSERT OR IGNORE INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
+            (slug, show["name"], show["feed_url"]),
+        )
+    db.commit()
+    db.close()
+    log.info("OPML import: %d show(s) processed.", len(shows))
+
+def run_fetch(config):
+    g = config["gpodder"]
+    if g.get("enable") is True:
+        remote = gpodder_sync(config)
+        if not remote:
+            log.warning("No subscriptions retrieved from gPodder; using local registry only.")
+        else:
+            added = register_remote_shows(remote)
+            pruned = prune_stale_shows(remote)
+            log.info("Sync: %d added, %d pruned.", added, pruned)
+    fetch_all_episodes()
 
 def main():
-    if "--delete-show" in sys.argv:
-        idx = sys.argv.index("--delete-show")
-        if idx + 1 < len(sys.argv):
-            delete_show(sys.argv[idx + 1])
-        else:
-            print("Usage: fetch_podcasts.py --delete-show <slug>")
-            sys.exit(1)
-        return
+    parser = argparse.ArgumentParser(description="Podcast fetcher for radio automation")
+    parser.add_argument("--list-shows", action="store_true", help="List registered shows")
+    parser.add_argument("--detail", action="store_true", help="With --list-shows, show feed URLs")
+    parser.add_argument("--add-show", metavar="FEED_URL", help="Add a show from a feed URL")
+    parser.add_argument("--delete-show", metavar="SLUG", help="Delete a show and its data")
+    parser.add_argument("--import-opml", metavar="FILE", help="Import shows from an OPML file")
+    args = parser.parse_args()
 
-    if "--add-show" in sys.argv:
-        idx = sys.argv.index("--add-show")
-        if idx + 1 < len(sys.argv):
-            add_show(sys.argv[idx + 1])
-        else:
-            print("Usage: fetch_podcasts.py --add-show <feed-url>")
-            sys.exit(1)
-        return
+    STATE_DIR.mkdir(exist_ok=True)
+    LOGS_DIR.mkdir(exist_ok=True)
+    PODCASTS_DIR.mkdir(exist_ok=True)
 
-    if "--import-opml" in sys.argv:
-        idx = sys.argv.index("--import-opml")
-        if idx + 1 < len(sys.argv):
-            import_opml_file(sys.argv[idx + 1])
-        else:
-            print("Usage: fetch_podcasts.py --import-opml <path-to-file.opml>")
-            sys.exit(1)
-        return
+    config = load_config()
 
-    if "--list-shows" in sys.argv:
-        list_shows(detail="--detail" in sys.argv)
-        return
-
-    # Normal run: optionally sync gpodder, then fetch all registered shows
-    cfg = load_config()
-    gp = cfg.get("gpodder", {})
-
-    if gp.get("enable", False):
-        print("--- Syncing subscriptions from gpodder.net ---")
-        try:
-            sync_gpoddernet()
-        except SystemExit:
-            raise
-        except Exception as e:
-            print(f"! gpodder sync failed (continuing with existing shows): {e}")
-
-    db = get_db()
-    shows = db.execute("SELECT name, feed_url, slug FROM shows").fetchall()
-
-    if not shows:
-        print("No shows registered. Import an OPML file, add a show, or enable gpodder sync.")
-        db.close()
-        return
-
-    print(f"--- Fetching episodes for {len(shows)} show(s) ---")
-    for show_name, feed_url, slug in shows:
-        try:
-            fetch_feed(show_name, feed_url, slug, db)
-        except Exception as e:
-            print(f"[{show_name}] FAILED: {e}")
-
-    db.close()
-
+    if args.list_shows:
+        list_shows(detail=args.detail)
+    elif args.add_show:
+        add_show(args.add_show)
+    elif args.delete_show:
+        delete_show(args.delete_show)
+    elif args.import_opml:
+        import_opml(args.import_opml)
+    else:
+        run_fetch(config)
 
 if __name__ == "__main__":
     main()

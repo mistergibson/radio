@@ -1,580 +1,200 @@
-#!/bin/bash
-#
-# install_for_jruby - Setup for liquidsoap radio automation stack (JRuby edition)
-# Target: Linux Mint 22.3 (Ubuntu 24.04 Noble based)
-#
-# Usage: sudo ./install_for_jruby
-# Must be run from within the target directory (e.g., /srv/audio/)
-#
-# Detects existing Java/JRuby; installs OpenJDK 21 and JRuby 10.1.1.0 into /opt
-# only if missing, integrating JRuby via update-alternatives. Installs gems one
-# at a time with a raised JVM heap to avoid OOM on low-RAM hosts.
-#
+#!/usr/bin/env bash
+# install_for_jruby - Provision the JRuby-based radio automation stack.
+# Detects/reuses existing Java and JRuby; installs gems one at a time.
+# Must be run as root from within the target directory (e.g. /srv/radio/).
+# Idempotent: safe to re-run.
+
 set -euo pipefail
 
-# -------------------------------------------------------
-# Determine install directory from script location
-# -------------------------------------------------------
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-INSTALL_DIR="$(dirname "$SCRIPT_PATH")"
+INSTALL_DIR="$(pwd)"
 SERVICE_NAME="$(basename "$INSTALL_DIR")"
-LIQUIDSOAP_USER="liquidsoap"
-
-JRUBY_VERSION="10.1.1.0"
-JRUBY_HOME="/opt/jruby-${JRUBY_VERSION}"
 GEM_HOME_LOCAL="$INSTALL_DIR/.gems"
+JRBURY_VERSION="10.1.1.0"
+MAVEN_BASE="https://repo1.maven.org/maven2/org/jruby/jruby-dist"
+JRUBY_HOME_PINNED="/opt/jruby-${JRBURY_VERSION}"
 
 echo "=== Radio Automation Installer (JRuby) ==="
-echo "Install directory: $INSTALL_DIR"
-echo "Service name:      $SERVICE_NAME"
-echo ""
+echo "Install dir:  $INSTALL_DIR"
+echo "Service name: $SERVICE_NAME"
+echo
 
-# -------------------------------------------------------
-# 0. Validate environment
-# -------------------------------------------------------
-if [ "$(id -u)" -ne 0 ]; then
-    echo "ERROR: This script must be run as root (sudo)."
-    exit 1
+# --- Prompt for config values (pre-fill from existing config.json) ---
+EXISTING_CONFIG="$INSTALL_DIR/config.json"
+declare -A CFG
+CFG[ICE_HOST]="localhost"
+CFG[ICE_PORT]="7777"
+CFG[ICE_MOUNT]="/audio.mp3"
+CFG[ICE_USER]="source"
+CFG[ICE_PASS]=""
+CFG[GPODDER_ENABLE]="false"
+CFG[GPODDER_HOST]="https://gpodder.net"
+CFG[GPODDER_USER]=""
+CFG[GPODDER_PASS]=""
+
+if [[ -f "$EXISTING_CONFIG" ]]; then
+  echo "Existing config.json found; using as defaults."
+  CFG[ICE_HOST]=$(jq -r '.icecast.host // "localhost"' "$EXISTING_CONFIG")
+  CFG[ICE_PORT]=$(jq -r '.icecast.port // 7777' "$EXISTING_CONFIG")
+  CFG[ICE_MOUNT]=$(jq -r '.icecast.mount // "/audio.mp3"' "$EXISTING_CONFIG")
+  CFG[ICE_USER]=$(jq -r '.icecast.username // "source"' "$EXISTING_CONFIG")
+  CFG[ICE_PASS]=$(jq -r '.icecast.password // ""' "$EXISTING_CONFIG")
+  CFG[GPODDER_ENABLE]=$(jq -r '.gpodder.enable // false' "$EXISTING_CONFIG")
+  CFG[GPODDER_HOST]=$(jq -r '.gpodder.host // "https://gpodder.net"' "$EXISTING_CONFIG")
+  CFG[GPODDER_USER]=$(jq -r '.gpodder.username // ""' "$EXISTING_CONFIG")
+  CFG[GPODDER_PASS]=$(jq -r '.gpodder.password // ""' "$EXISTING_CONFIG")
 fi
 
-if [ ! -d "$INSTALL_DIR" ]; then
-    echo "ERROR: Install directory $INSTALL_DIR does not exist."
-    exit 1
-fi
+read -rp "Icecast host [$CFG[ICE_HOST]]: " v; CFG[ICE_HOST]=${v:-$CFG[ICE_HOST]}
+read -rp "Icecast port [$CFG[ICE_PORT]]: " v; CFG[ICE_PORT]=${v:-$CFG[ICE_PORT]}
+read -rp "Icecast mount [$CFG[ICE_MOUNT]]: " v; CFG[ICE_MOUNT]=${v:-$CFG[ICE_MOUNT]}
+read -rp "Icecast source username [$CFG[ICE_USER]]: " v; CFG[ICE_USER]=${v:-$CFG[ICE_USER]}
+read -rsp "Icecast source password [$CFG[ICE_PASS]]: "; echo; CFG[ICE_PASS]=${v:-$CFG[ICE_PASS]}
+read -rp "Enable gPodder sync? (true/false) [$CFG[GPODDER_ENABLE]]: " v; CFG[GPODDER_ENABLE]=${v:-$CFG[GPODDER_ENABLE]}
+read -rp "gPodder host [$CFG[GPODDER_HOST]]: " v; CFG[GPODDER_HOST]=${v:-$CFG[GPODDER_HOST]}
+read -rp "gPodder username [$CFG[GPODDER_USER]]: " v; CFG[GPODDER_USER]=${v:-$CFG[GPODDER_USER]}
+read -rsp "gPodder password [$CFG[GPODDER_PASS]]: "; echo; CFG[GPODDER_PASS]=${v:-$CFG[GPODDER_PASS]}
 
-if [ ! -w "$INSTALL_DIR" ]; then
-    echo "ERROR: Cannot write to $INSTALL_DIR. Check permissions."
-    exit 1
-fi
+echo
+echo "Summary:"
+echo "  Icecast: ${CFG[ICE_HOST]}:${CFG[ICE_PORT]}${CFG[ICE_MOUNT]}"
+echo "  gPodder sync: ${CFG[GPODDER_ENABLE]}"
+read -rp "Proceed? [y/N] " confirm
+[[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
-REQUIRED_DIRS=(
-    "music"
-    "podcasts"
-    "jingles"
-    "announcements"
-    "playlists"
-    "state"
-    "logs"
-)
+# --- Base packages ---
+echo "Installing base packages..."
+apt-get update -qq
+apt-get install -y -qq liquidsoap icecast2 jq curl unzip ca-certificates >/dev/null
 
-# -------------------------------------------------------
-# Helper: prompt with default value
-# -------------------------------------------------------
-prompt() {
-    local var_name="$1"
-    local prompt_text="$2"
-    local default_value="${3:-}"
-    local hide_input="${4:-false}"
-
-    if [ -n "$default_value" ]; then
-        read -rp "$prompt_text [$default_value]: " input
-        if [ -z "$input" ]; then
-            eval "$var_name=$default_value"
-        else
-            eval "$var_name=\$input"
-        fi
-    else
-        if [ "$hide_input" = "true" ]; then
-            read -rsp "$prompt_text: " input
-            echo ""
-            eval "$var_name=\$input"
-        else
-            read -rp "$prompt_text: " input
-            eval "$var_name=\$input"
-        fi
-    fi
-}
-
-prompt_confirm() {
-    local var_name="$1"
-    local prompt_text="$2"
-    local default_value="${3:-no}"
-    read -rp "$prompt_text [$default_value]: " input
-    if [ -z "$input" ]; then
-        input="$default_value"
-    fi
-    case "$input" in
-        [Yy]* ) eval "$var_name=true" ;;
-        *      ) eval "$var_name=false" ;;
-    esac
-}
-
-# -------------------------------------------------------
-# 1. Interactive configuration
-# -------------------------------------------------------
-CONFIG_FILE="$INSTALL_DIR/config.json"
-
-EXISTING_CONFIG=false
-if [ -f "$CONFIG_FILE" ]; then
-    EXISTING_CONFIG=true
-    echo "--- Loading existing config.json for defaults ---"
-    ICECAST_HOST_DEFAULT=$(jq -r '.icecast.host // "localhost"' "$CONFIG_FILE")
-    ICECAST_PORT_DEFAULT=$(jq -r '.icecast.port // 7777' "$CONFIG_FILE")
-    ICECAST_MOUNT_DEFAULT=$(jq -r '.icecast.mount // "/audio.mp3"' "$CONFIG_FILE")
-    ICECAST_USERNAME_DEFAULT=$(jq -r '.icecast.username // "source"' "$CONFIG_FILE")
-    GPODDER_ENABLE_DEFAULT=$(jq -r 'if .gpodder.enable == true then "yes" else "no" end' "$CONFIG_FILE")
-    GPODDER_HOST_DEFAULT=$(jq -r '.gpodder.host // "https://gpodder.net"' "$CONFIG_FILE")
-    GPODDER_USERNAME_DEFAULT=$(jq -r '.gpodder.username // ""' "$CONFIG_FILE")
-else
-    ICECAST_HOST_DEFAULT="localhost"
-    ICECAST_PORT_DEFAULT="7777"
-    ICECAST_MOUNT_DEFAULT="/audio.mp3"
-    ICECAST_USERNAME_DEFAULT="source"
-    GPODDER_ENABLE_DEFAULT="no"
-    GPODDER_HOST_DEFAULT="https://gpodder.net"
-    GPODDER_USERNAME_DEFAULT=""
-fi
-
-echo ""
-echo "--- Icecast Settings ---"
-echo ""
-
-ICECAST_HOST=""
-ICECAST_PORT=""
-ICECAST_MOUNT=""
-ICECAST_USERNAME=""
-ICECAST_PASSWORD=""
-
-while true; do
-    prompt ICECAST_HOST "Icecast host" "$ICECAST_HOST_DEFAULT"
-    [[ "$ICECAST_HOST" =~ ^[a-zA-Z0-9._-]+$ ]] && break
-    echo "Invalid hostname. Try again."
-done
-
-while true; do
-    prompt ICECAST_PORT "Source port" "$ICECAST_PORT_DEFAULT"
-    [[ "$ICECAST_PORT" =~ ^[0-9]{1,5}$ ]] && (( ICECAST_PORT >= 1 )) && (( ICECAST_PORT <= 65535 )) && break
-    echo "Port must be a number between 1 and 65535. Try again."
-done
-
-while true; do
-    prompt ICECAST_MOUNT "Mount point" "$ICECAST_MOUNT_DEFAULT"
-    [[ "$ICECAST_MOUNT" == /* ]] && break
-    echo "Mount point must start with /. Try again."
-done
-
-prompt ICECAST_USERNAME "Source username" "$ICECAST_USERNAME_DEFAULT"
-
-while true; do
-    prompt ICECAST_PASSWORD "Source password" "" "true"
-    [ -n "$ICECAST_PASSWORD" ] && break
-    echo "Password cannot be empty. Try again."
-done
-
-echo ""
-echo "--- gPodder.net Sync Settings ---"
-echo ""
-
-GPODDER_ENABLE=false
-if [ "$GPODDER_ENABLE_DEFAULT" = "yes" ]; then
-    prompt_confirm GPODDER_ENABLE "Enable gPodder.net subscription sync?" "yes"
-else
-    prompt_confirm GPODDER_ENABLE "Enable gPodder.net subscription sync?" "no"
-fi
-
-GPODDER_HOST=""
-GPODDER_USERNAME=""
-GPODDER_PASSWORD=""
-
-if [ "$GPODDER_ENABLE" = "true" ]; then
-    prompt GPODDER_HOST "gPodder host" "$GPODDER_HOST_DEFAULT"
-    while true; do
-        prompt GPODDER_USERNAME "gPodder username/email" "$GPODDER_USERNAME_DEFAULT"
-        [ -n "$GPODDER_USERNAME" ] && break
-        echo "Username cannot be empty. Try again."
-    done
-    while true; do
-        prompt GPODDER_PASSWORD "gPodder password" "" "true"
-        [ -n "$GPODDER_PASSWORD" ] && break
-        echo "Password cannot be empty. Try again."
-    done
-fi
-
-echo ""
-echo "--- Summary ---"
-echo "  Icecast:   ${ICECAST_HOST}:${ICECAST_PORT}${ICECAST_MOUNT} (user: ${ICECAST_USERNAME})"
-echo "  gPodder:   $( [ "$GPODDER_ENABLE" = "true" ] && echo "enabled (${GPODDER_USERNAME}@${GPODDER_HOST})" || echo "disabled" )"
-echo ""
-
-CONFIRM_INSTALL=false
-prompt_confirm CONFIRM_INSTALL "Proceed with these settings?" "yes"
-if [ "$CONFIRM_INSTALL" != "true" ]; then
-    echo "Aborted by user."
-    exit 0
-fi
-
-# -------------------------------------------------------
-# 2. Base system packages (always needed regardless of Java state)
-# -------------------------------------------------------
-echo ""
-echo "--- Installing base system packages ---"
-apt-get update
-apt-get install -y \
-    liquidsoap \
-    icecast2 \
-    jq \
-    curl \
-    ca-certificates \
-    unzip
-
-# -------------------------------------------------------
-# 3. Detect / install Java (OpenJDK 21 headless)
-# -------------------------------------------------------
-echo ""
-echo "--- Checking Java ---"
+# --- Detect or install Java (>= 21) ---
 JAVA_OK=false
-if command -v java >/dev/null 2>&1; then
-    JAVA_VER_LINE=$(java -version 2>&1 | head -1)
-    # Extract major version: handles both '"21.0.x"' and '1.8.0_xxx' styles
-    JAVA_MAJOR=$(echo "$JAVA_VER_LINE" | sed -nE 's/.*"([0-9]+)(\.[0-9]+)?".*/\1/p')
-    if [ -n "$JAVA_MAJOR" ] && [ "$JAVA_MAJOR" -ge 21 ]; then
-        JAVA_OK=true
-        echo "  Found suitable Java ($JAVA_VER_LINE)"
-    else
-        echo "  Java found but version too old ($JAVA_VER_LINE); installing OpenJDK 21."
-    fi
+if command -v java &>/dev/null; then
+  JAVA_VER=$(java -version 2>&1 | head -1 | sed 's/.*"\([0-9]*\)\..*/\1/')
+  if (( JAVA_VER >= 21 )); then
+    echo "Found Java $JAVA_VER; reusing."
+    JAVA_OK=true
+  fi
+fi
+if [[ "$JAVA_OK" != "true" ]]; then
+  echo "Installing OpenJDK 21 headless..."
+  apt-get install -y -qq openjdk-21-jdk-headless >/dev/null
+fi
+
+# --- Detect or install JRuby ---
+JRUBY_BIN=""
+if [[ -x "$JRUBY_HOME_PINNED/bin/jruby" ]]; then
+  JRUBY_BIN="$JRUBY_HOME_PINNED/bin/jruby"
+  echo "Found pinned JRuby at $JRUBY_HOME_PINNED"
+elif command -v jruby &>/dev/null; then
+  JRUBY_BIN="$(command -v jruby)"
+  echo "Found JRuby on PATH: $JRUBY_BIN"
 else
-    echo "  No Java detected; installing OpenJDK 21."
+  echo "Downloading JRuby ${JRBURY_VERSION} from Maven Central..."
+  TARBALL="jruby-dist-${JRBURY_VERSION}-bin.tar.gz"
+  URL="${MAVEN_BASE}/${JRBURY_VERSION}/${TARBALL}"
+  cd /tmp
+  curl -fsSL -o "$TARBALL" "$URL"
+  tar xzf "$TARBALL"
+  mv "jruby-${JRBURY_VERSION}" "$JRUBY_HOME_PINNED"
+  rm -f "$TARBALL"
+  JRUBY_BIN="$JRUBY_HOME_PINNED/bin/jruby"
+  echo "Installed JRuby to $JRUBY_HOME_PINNED"
 fi
 
-if [ "$JAVA_OK" != "true" ]; then
-    apt-get install -y openjdk-21-jre-headless
-    echo "  Installed OpenJDK 21."
-fi
-
-# -------------------------------------------------------
-# 4. Detect / install JRuby
-# -------------------------------------------------------
-echo ""
-echo "--- Checking JRuby ---"
-JRUBY_FOUND=""
-
-# Preferred: our pinned home already present
-if [ -x "$JRUBY_HOME/bin/jruby" ]; then
-    JRUBY_FOUND="$JRUBY_HOME/bin/jruby"
-    echo "  Found JRuby at $JRUBY_HOME"
-fi
-
-# Fallback: any jruby resolvable on PATH (system, other /opt version, etc.)
-if [ -z "$JRUBY_FOUND" ] && command -v jruby >/dev/null 2>&1; then
-    DETECTED_JRUBY="$(command -v jruby)"
-    DETECTED_JRUBY="$(readlink -f "$DETECTED_JRUBY")"
-    JRUBY_FOUND="$DETECTED_JRUBY"
-    echo "  Found existing JRuby on PATH: $DETECTED_JRUBY"
-    echo "  ($( "$DETECTED_JRUBY" -v 2>/dev/null | head -1 ))"
-fi
-
-if [ -z "$JRUBY_FOUND" ]; then
-    echo "  No JRuby detected; installing JRuby ${JRUBY_VERSION} to /opt ..."
-    JRUBY_TARBALL="/tmp/jruby-dist-${JRUBY_VERSION}-bin.tar.gz"
-    # Post-9.1.14.0 releases are distributed via Maven Central as jruby-dist-*
-    curl -fsSL "https://repo1.maven.org/maven2/org/jruby/jruby-dist/${JRUBY_VERSION}/jruby-dist-${JRUBY_VERSION}-bin.tar.gz" -o "$JRUBY_TARBALL"
-    mkdir -p /opt
-    tar -xzf "$JRUBY_TARBALL" -C /opt
-    rm -f "$JRUBY_TARBALL"
-    ln -sfn "$JRUBY_HOME" /opt/jruby-current
-    JRUBY_FOUND="$JRUBY_HOME/bin/jruby"
-    echo "  Installed JRuby to $JRUBY_HOME"
-fi
-
-# Derive the effective JRuby home from whichever binary we ended up using
-EFF_JRUBY_BIN="$JRUBY_FOUND"
-EFF_JRUBY_HOME="$(dirname "$(dirname "$EFF_JRUBY_BIN")")"
-export PATH="$EFF_JRUBY_HOME/bin:$PATH"
-
-# -------------------------------------------------------
-# 5. Integrate JRuby with the system via update-alternatives
-# -------------------------------------------------------
-echo "--- Integrating JRuby via update-alternatives ---"
-update-alternatives --install /usr/local/bin/jruby jruby "$EFF_JRUBY_BIN" 100
-# Also expose bundle/gem/rake under alternatives so they resolve system-wide
-for tool in bundle gem rake irb; do
-    if [ -x "$EFF_JRUBY_HOME/bin/$tool" ]; then
-        update-alternatives --install "/usr/local/bin/$tool" "$tool" "$EFF_JRUBY_HOME/bin/$tool" 100
-    fi
+# --- Register via update-alternatives ---
+for cmd in jruby bundle gem rake irb; do
+  ALT_SRC="$($JRUBY_BIN -e "puts Gem.bindir" 2>/dev/null || echo "$(${JRUBY_BIN%/jruby}${cmd}" --version &>/dev/null && which ${cmd} 2>/dev/null || echo "$JRUBY_HOME_PINNED/bin/${cmd}")")"
+  # Simpler: just link the known bin paths
+  LINK_TARGET="$JRUBY_HOME_PINNED/bin/${cmd}"
+  if [[ -x "$LINK_TARGET" ]]; then
+    ln -sf "$LINK_TARGET" "/usr/local/bin/${cmd}"
+    update-alternatives --install "/usr/local/bin/${cmd}" "${cmd}" "$LINK_TARGET" 100 || true
+  fi
 done
-echo "  Registered jruby -> $EFF_JRUBY_BIN (priority 100)"
+echo "JRuby integrated via /usr/local/bin symlinks."
 
-# Sanity-check that the integrated binary actually runs
-if ! "$EFF_JRUBY_BIN" -v >/dev/null 2>&1; then
-    echo "ERROR: Integrated JRuby binary failed to execute. Aborting."
-    exit 1
-fi
-echo "  Verified: $("${EFF_JRUBY_BIN}" -v 2>/dev/null | head -1)"
-
-# -------------------------------------------------------
-# 6. Install gems into a project-local gem home (one at a time)
-# -------------------------------------------------------
-echo "--- Installing Ruby gems ---"
+# --- Install gems one at a time (avoid OOM on low-RAM hosts) ---
 export GEM_HOME="$GEM_HOME_LOCAL"
 export GEM_PATH="$GEM_HOME_LOCAL"
-
-# Raise the JVM heap for gem operations. JRuby defaults to ~500MB, which is
-# too small when bundler resolves multiple gems at once on a low-RAM host.
 export JRUBY_OPTS="-J-Xmx1g -J-Xss512k"
 
-install_gem() {
-    local name="$1"
-    echo "  Installing gem: $name"
-    if ! "$EFF_JRUBY_BIN" -S gem install "$name" --no-document; then
-        echo "ERROR: Failed to install gem '$name'."
-        exit 1
-    fi
-}
+echo "Installing bundler..."
+"$JRUBY_BIN" -S gem install bundler --no-document 2>&1 | tail -1
+echo "Installing nokogiri..."
+"$JRUBY_BIN" -S gem install nokogiri --no-document 2>&1 | tail -1
+echo "Installing sqlite3..."
+"$JRUBY_BIN" -S gem install sqlite3 --no-document 2>&1 | tail -1
+echo "Installing json..."
+"$JRUBY_BIN" -S gem install json --no-document 2>&1 | tail -1
 
-# Install bundler first (needed to drive bundle install), then each dependency
-# separately so a single OOM can't take down the whole set.
-install_gem bundler
-install_gem nokogiri
-install_gem sqlite3
-install_gem json
-
-# Lock versions against the Gemfile now that every gem is present.
-(cd "$INSTALL_DIR" && \
-    GEM_HOME="$GEM_HOME_LOCAL" GEM_PATH="$GEM_HOME_LOCAL" \
-    JRUBY_OPTS="$JRUBY_OPTS" \
-    "$EFF_JRUBY_BIN" -S bundle install --quiet)
-
-echo "  Gems installed to $GEM_HOME_LOCAL"
-
-# -------------------------------------------------------
-# 7. Create and verify directory structure
-# -------------------------------------------------------
-echo "--- Creating directory structure ---"
-MISSING=()
-for dir in "${REQUIRED_DIRS[@]}"; do
-    full_path="$INSTALL_DIR/$dir"
-    if [ ! -d "$full_path" ]; then
-        mkdir -p "$full_path"
-        MISSING+=("$dir")
-    fi
+# --- Create directory structure ---
+for d in music podcasts jingles announcements playlists state logs; do
+  mkdir -p "$INSTALL_DIR/$d"
 done
 
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "  Created: ${MISSING[*]}"
-else
-    echo "  All directories already present."
-fi
-
-FAILED=()
-for dir in "${REQUIRED_DIRS[@]}"; do
-    if [ ! -d "$INSTALL_DIR/$dir" ]; then
-        FAILED+=("$dir")
-    fi
-done
-
-if [ ${#FAILED[@]} -gt 0 ]; then
-    echo "ERROR: Failed to create directories: ${FAILED[*]}"
-    exit 1
-fi
-
-# -------------------------------------------------------
-# 8. Generate config.json from collected settings
-# -------------------------------------------------------
-echo "--- Generating config.json ---"
-
-cat > "$CONFIG_FILE" << EOF
+# --- Generate config.json ---
+cat > "$INSTALL_DIR/config.json" <<EOF
 {
   "icecast": {
-    "host": "${ICECAST_HOST}",
-    "port": ${ICECAST_PORT},
-    "mount": "${ICECAST_MOUNT}",
-    "username": "${ICECAST_USERNAME}",
-    "password": "${ICECAST_PASSWORD}"
+    "host": "${CFG[ICE_HOST]}",
+    "port": ${CFG[ICE_PORT]},
+    "mount": "${CFG[ICE_MOUNT]}",
+    "username": "${CFG[ICE_USER]}",
+    "password": "${CFG[ICE_PASS]}"
   },
   "gpodder": {
-    "enable": ${GPODDER_ENABLE},
-    "host": "${GPODDER_HOST}",
-    "username": "${GPODDER_USERNAME}",
-    "password": "${GPODDER_PASSWORD}"
+    "enable": ${CFG[GPODDER_ENABLE]},
+    "host": "${CFG[GPODDER_HOST]}",
+    "username": "${CFG[GPODDER_USER]}",
+    "password": "${CFG[GPODDER_PASS]}"
   }
 }
 EOF
+chmod 600 "$INSTALL_DIR/config.json"
 
-chmod 600 "$CONFIG_FILE"
-echo "  Written: $CONFIG_FILE"
-
-# -------------------------------------------------------
-# 9. Create schedule.txt template (if not present)
-# -------------------------------------------------------
-SCHEDULE_FILE="$INSTALL_DIR/schedule.txt"
-if [ ! -f "$SCHEDULE_FILE" ]; then
-    echo "--- Creating schedule.txt template ---"
-    cat > "$SCHEDULE_FILE" << 'EOF'
-# Radio Schedule
-# Format: min hour dom mon dow TYPE TARGET [RUNLENGTH_SECONDS]
-# TYPE: show | stream
-# RUNLENGTH required for stream entries, ignored for show entries
-#
-# Examples:
-# 0 8 * * 2     show    hardcore_history
-# 0 6 * * 1     stream  http://example.org:8000/live.mp3   3600
-EOF
-else
-    echo "--- schedule.txt already exists, skipping ---"
+# --- Ensure liquidsoap user exists ---
+if ! id liquidsoap &>/dev/null; then
+  useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin liquidsoap
 fi
+chown -R liquidsoap:liquidsoap "$INSTALL_DIR"
 
-# -------------------------------------------------------
-# 10. Verify required project files exist
-# -------------------------------------------------------
-echo "--- Verifying project files ---"
-PROJECT_FILES=("station.liq" "fetch_podcasts.rb" "update_playlists.rb" "Gemfile")
-FILE_ERRORS=()
-for f in "${PROJECT_FILES[@]}"; do
-    if [ ! -f "$INSTALL_DIR/$f" ]; then
-        FILE_ERRORS+=("$f")
-    else
-        echo "  Found: $f"
-    fi
-done
-
-if [ ${#FILE_ERRORS[@]} -gt 0 ]; then
-    echo "WARNING: Missing expected files: ${FILE_ERRORS[*]}"
-    echo "         The service will not start until these are in place."
-fi
-
-# -------------------------------------------------------
-# 11. Create systemd service named after the directory
-# -------------------------------------------------------
-echo "--- Creating systemd service: ${SERVICE_NAME}.service ---"
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
+# --- Write systemd service ---
+cat > /etc/systemd/system/"$SERVICE_NAME".service <<EOF
 [Unit]
-Description=Liquidsoap radio automation (${SERVICE_NAME})
+Description=Liquidsoap radio station ($SERVICE_NAME)
 After=network.target icecast2.service
 
 [Service]
-Type=simple
-User=${LIQUIDSOAP_USER}
-WorkingDirectory=${INSTALL_DIR}
+User=liquidsoap
+WorkingDirectory=$INSTALL_DIR
 Environment=GEM_HOME=${GEM_HOME_LOCAL}
 Environment=GEM_PATH=${GEM_HOME_LOCAL}
-ExecStart=/usr/bin/liquidsoap ${INSTALL_DIR}/station.liq
+Environment=JRUBY_OPTS=-J-Xmx1g -J-Xss512k
+ExecStart=/usr/bin/liquidsoap $INSTALL_DIR/station.liq
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:${INSTALL_DIR}/logs/liquidsoap.log
-StandardError=append:${INSTALL_DIR}/logs/liquidsoap.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# -------------------------------------------------------
-# 12. Create cron jobs (hourly fetch + hourly playlist update)
-# -------------------------------------------------------
-echo "--- Setting up cron jobs ---"
+# --- Set up cron jobs (deduplicated) ---
+FETCH_CMD="sudo -u liquidsoap env GEM_HOME=${GEM_HOME_LOCAL} GEM_PATH=${GEM_HOME_LOCAL} JRUBY_OPTS=-J-Xmx1g -J-Xss512k /usr/local/bin/jruby -S bundle exec $INSTALL_DIR/fetch_podcasts.rb >> $INSTALL_DIR/logs/cron_fetch.log 2>&1"
+UPDATE_CMD="sudo -u liquidsoap env GEM_HOME=${GEM_HOME_LOCAL} GEM_PATH=${GEM_HOME_LOCAL} JRUBY_OPTS=-J-Xmx1g -J-Xss512k /usr/local/bin/jruby -S bundle exec $INSTALL_DIR/update_playlists.rb >> $INSTALL_DIR/logs/cron_update.log 2>&1"
 
-# Cron runs with a minimal PATH, so reference the absolute integrated path.
-RUBY_RUN="cd $INSTALL_DIR && GEM_HOME=$GEM_HOME_LOCAL GEM_PATH=$GEM_HOME_LOCAL /usr/local/bin/jruby -S bundle exec"
-FETCH_CRON="0 * * * * $RUBY_RUN fetch_podcasts.rb >> $INSTALL_DIR/logs/fetch.log 2>&1"
-UPDATE_CRON="30 * * * * $RUBY_RUN update_playlists.rb >> $INSTALL_DIR/logs/update.log 2>&1"
+(crontab -l 2>/dev/null | grep -v "fetch_podcasts.rb"; echo "0 * * * * $FETCH_CMD") | crontab -
+(crontab -l 2>/dev/null | grep -v "update_playlists.rb"; echo "30 * * * * $UPDATE_CMD") | crontab -
 
-EXISTING_CRON=$(crontab -l -u "$LIQUIDSOAP_USER" 2>/dev/null || true)
-CLEANED_CRON=$(echo "$EXISTING_CRON" | grep -v "fetch_podcasts.rb\|update_playlists.rb" || true)
-
-if ! echo "$EXISTING_CRON" | grep -q "fetch_podcasts.rb"; then
-    CLEANED_CRON="${CLEANED_CRON:+$CLEANED_CRON
-}$FETCH_CRON"
-    echo "  Added: fetch_podcasts.rb (hourly)"
-else
-    echo "  Skipped: fetch_podcasts.rb job already exists"
-fi
-
-if ! echo "$EXISTING_CRON" | grep -q "update_playlists.rb"; then
-    CLEANED_CRON="${CLEANED_CRON:+$CLEANED_CRON
-}$UPDATE_CRON"
-    echo "  Added: update_playlists.rb (hourly at :30)"
-else
-    echo "  Skipped: update_playlists.rb job already exists"
-fi
-
-echo "$CLEANED_CRON" | crontab -u "$LIQUIDSOAP_USER" -
-
-# -------------------------------------------------------
-# 13. Permissions
-# -------------------------------------------------------
-echo "--- Setting ownership and permissions ---"
-id -u "$LIQUIDSOAP_USER" &>/dev/null || useradd --system --shell /usr/sbin/nologin "$LIQUIDSOAP_USER"
-chown -R "${LIQUIDSOAP_USER}:${LIQUIDSOAP_USER}" "$INSTALL_DIR"
-chmod 700 "$INSTALL_DIR/state"
-chmod 700 "$INSTALL_DIR/logs"
-
+# --- Reload and enable ---
 systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
 
-# -------------------------------------------------------
-# 14. Final verification
-# -------------------------------------------------------
-echo ""
-echo "=== Final Verification ==="
-ALL_OK=true
-for dir in "${REQUIRED_DIRS[@]}"; do
-    if [ -d "$INSTALL_DIR/$dir" ] && [ -r "$INSTALL_DIR/$dir" ] && [ -w "$INSTALL_DIR/$dir" ]; then
-        printf "  [OK] %-20s\n" "$dir/"
-    else
-        printf "  [FAIL] %-20s (missing or inaccessible)\n" "$dir/"
-        ALL_OK=false
-    fi
-done
-
-if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
-    echo "  [OK] Service file: ${SERVICE_NAME}.service"
-else
-    echo "  [FAIL] Service file not created"
-    ALL_OK=false
-fi
-
-if [ -f "$CONFIG_FILE" ]; then
-    if jq empty "$CONFIG_FILE" 2>/dev/null; then
-        echo "  [OK] Config: config.json (valid JSON)"
-    else
-        echo "  [FAIL] Config: config.json (invalid JSON)"
-        ALL_OK=false
-    fi
-else
-    echo "  [FAIL] Config file missing"
-    ALL_OK=false
-fi
-
-if [ -f "$SCHEDULE_FILE" ]; then
-    echo "  [OK] Schedule: schedule.txt"
-else
-    echo "  [FAIL] Schedule file missing"
-    ALL_OK=false
-fi
-
-if command -v java >/dev/null 2>&1; then
-    echo "  [OK] Java: $(java -version 2>&1 | head -1)"
-else
-    echo "  [FAIL] Java not available"
-    ALL_OK=false
-fi
-
-if [ -x /usr/local/bin/jruby ] && /usr/local/bin/jruby -v >/dev/null 2>&1; then
-    echo "  [OK] JRuby: $(/usr/local/bin/jruby -v 2>/dev/null | head -1)"
-else
-    echo "  [FAIL] Integrated JRuby (/usr/local/bin/jruby) not runnable"
-    ALL_OK=false
-fi
-
-echo ""
-if [ "$ALL_OK" = true ]; then
-    echo "=== Installation Complete ==="
-else
-    echo "=== Installation Finished With Errors ==="
-    echo "Review the [FAIL] items above before starting the service."
-fi
-
-echo ""
+echo
+echo "=== Installation complete ==="
 echo "Next steps:"
-echo "  1. Place your music in $INSTALL_DIR/music/"
-echo "  2. Edit $SCHEDULE_FILE with your show/stream schedule"
-echo "  3. Review/edit $INSTALL_DIR/station.liq"
-echo "  4. Test: sudo systemctl start icecast2 && sudo systemctl start ${SERVICE_NAME}"
-echo "  5. Check logs: tail -f $INSTALL_DIR/logs/liquidsoap.log"
-echo ""
-echo "Manage shows (run as the liquidsoap user):"
-RB_PREFIX="sudo -u liquidsoap env GEM_HOME=$GEM_HOME_LOCAL GEM_PATH=$GEM_HOME_LOCAL /usr/local/bin/jruby -S bundle exec"
-echo "  List:        $RB_PREFIX $INSTALL_DIR/fetch_podcasts.rb --list-shows --detail"
-echo "  Delete:      $RB_PREFIX $INSTALL_DIR/fetch_podcasts.rb --delete-show <slug>"
-echo "  Import OPML: $RB_PREFIX $INSTALL_DIR/fetch_podcasts.rb --import-opml <file.opml>"
-echo "  Add show:    $RB_PREFIX $INSTALL_DIR/fetch_podcasts.rb --add-show <feed-url>"
-echo "  JSON state:  $RB_PREFIX $INSTALL_DIR/update_playlists.rb --json"
+echo "  1. Drop MP3/M4A files into $INSTALL_DIR/music/"
+echo "  2. Edit $INSTALL_DIR/schedule.txt with your show schedule"
+echo "  3. Review $INSTALL_DIR/station.liq"
+echo "  4. Start services:"
+echo "       sudo systemctl start icecast2"
+echo "       sudo systemctl start $SERVICE_NAME"

@@ -1,3 +1,5 @@
+[![Hippocratic License HL3-FULL](https://img.shields.io/static/v1?label=Hippocratic%20License&message=HL3-FULL&labelColor=5e2751&color=bc8c3d)](https://firstdonoharm.dev/version/3/0/full.html)
+
 # Radio Automation Stack
 
 A self-hosted internet radio automation system for Linux Mint 22.3 (Ubuntu 24.04 Noble). It continuously plays background music, interrupts it with scheduled podcast shows and external streams, downloads new podcast episodes from RSS feeds, and manages playback history — all fed to an Icecast server via liquidsoap.
@@ -48,7 +50,6 @@ The moving parts:
 | `config.json` | Credentials and connection settings | No (secret) |
 | `schedule.txt` | Human-edited cron schedule of shows/streams | Yes |
 | `station.liq` | liquidsoap configuration | Yes |
-| `Gemfile` | Ruby gem dependencies (Ruby stack) | Yes |
 
 ## Configuration: `config.json`
 
@@ -214,7 +215,7 @@ For each show, the updater scans `podcasts/<slug>/` recursively for audio files,
 The liquidsoap program itself. Not invoked directly — it runs under the systemd service. Key behaviors:
 
 - Resolves all paths relative to its own location via `configure.bindir()`, so the whole tree can be relocated without editing the file.
-- Loads Icecast credentials from `config.json`.
+- Loads Icecast credentials from `config.json` using an annotated `json.parse` binding.
 - Maintains a continuous random background-music playlist drawn from `music/`.
 - Uses a request queue as the primary source: when a scheduled show or stream is triggered, it plays ahead of the music fallback; when the queue drains, background music resumes.
 
