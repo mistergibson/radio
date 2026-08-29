@@ -1,37 +1,20 @@
-# Local Ruby gems (installed by install_for_jruby)
-.gems/
+# Secrets and local configuration
+config.json
 
-# Python virtualenv
-.venv/
-
-# Runtime state: SQLite DBs and journals
+# Runtime data (should live under the storage path, not here)
 state/
-*.db
-*.db-journal
-*.sqlite3
-*.sqlite3-journal
-
-# Logs
 logs/
+playlists/
+*.db
 *.log
 
-# Large / regenerable media directories
-music/
+# Downloaded media (belongs under the storage path)
 podcasts/
+music/
 jingles/
 announcements/
 
-# Generated playlist files
-playlists/
-*.pls
-
-# Secrets
-config.json
-
-# OS / editor noise
+# OS cruft
 .DS_Store
 Thumbs.db
-*.swp
-*~
-.idea/
-.vscode/
+

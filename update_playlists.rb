@@ -8,13 +8,28 @@ require "optparse"
 
 module RadioAutomation
   ROOT          = File.expand_path("..", __dir__)
-  STATE_DIR     = File.join(ROOT, "state")
-  SUBS_DB       = File.join(STATE_DIR, "subscriptions.db")
-  PLAYED_DB     = File.join(STATE_DIR, "played.db")
-  PODCASTS_DIR  = File.join(ROOT, "podcasts")
-  PLAYLISTS_DIR = File.join(ROOT, "playlists")
-  LOGS_DIR      = File.join(ROOT, "logs")
+  CONFIG_PATH   = File.join(ROOT, "config.json")
   AUDIO_EXTS    = [".mp3", ".m4a"]
+
+  STORAGE_DIR   = nil
+  STATE_DIR     = nil
+  SUBS_DB       = nil
+  PLAYED_DB     = nil
+  PODCASTS_DIR  = nil
+  PLAYLISTS_DIR = nil
+  LOGS_DIR      = nil
+
+  def self.init_paths
+    cfg = JSON.parse(File.read(CONFIG_PATH))
+    @storage = File.expand_path(cfg["storage"])
+    self.STORAGE_DIR   = @storage
+    self.STATE_DIR     = File.join(@storage, "state")
+    self.SUBS_DB       = File.join(STATE_DIR, "subscriptions.db")
+    self.PLAYED_DB     = File.join(STATE_DIR, "played.db")
+    self.PODCASTS_DIR  = File.join(@storage, "podcasts")
+    self.PLAYLISTS_DIR = File.join(@storage, "playlists")
+    self.LOGS_DIR      = File.join(@storage, "logs")
+  end
 
   def self.log_info(msg)
     puts "#{Time.now.iso8601} [INFO] #{msg}"
@@ -139,6 +154,7 @@ module RadioAutomation
       opts.on("--json", "Emit JSON summary and exit") { options[:json] = true }
     end.parse!
 
+    init_paths
     FileUtils.mkdir_p(STATE_DIR)
     FileUtils.mkdir_p(LOGS_DIR)
     FileUtils.mkdir_p(PLAYLISTS_DIR)

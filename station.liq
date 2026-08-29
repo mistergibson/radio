@@ -3,16 +3,18 @@
 # ---------------------------------------------------------------
 # station.liq - Liquidsoap configuration for radio automation
 # Auto-detects its own location so all paths are relative.
+# Music/jingles/announcements live under the storage path from
+# config.json; code stays in the install dir.
 # ---------------------------------------------------------------
 
 configure.bindir()
 
-set("log.file.path", "#{bindir()}/logs/liquidsoap.log")
 set("log.stdout", true)
 set("log.level", 3)
 
-# --- Load Icecast credentials from config.json ---
-let json.parse (cfg : {
+# --- Load Icecast credentials + storage path from config.json ---
+let cfg : {
+  storage: string,
   icecast: {
     host: string,
     port: int,
@@ -26,22 +28,24 @@ let json.parse (cfg : {
     username: string,
     password: string
   }
-}) = file.contents("#{bindir()}/config.json")
+} = json.parse(file.contents("#{bindir()}/config.json"))
 
 let ic_host     = cfg.icecast.host
 let ic_port     = cfg.icecast.port
 let ic_mount    = cfg.icecast.mount
 let ic_username = cfg.icecast.username
 let ic_password = cfg.icecast.password
+let storage     = cfg.storage
+
+set("log.file.path", "#{storage}/logs/liquidsoap.log")
 
 # --- Background music library (recursive scan for mp3/m4a) ---
-music_dir = "#{bindir()}/music"
 music_playlist =
   request.cue(
     playlist(
       recurse=true,
       pattern="\\.(mp3|m4a)$",
-      "#{music_dir}"
+      "#{storage}/music"
     )
   )
 
@@ -49,8 +53,8 @@ music_playlist =
 sched_queue = request.queue(id="scheduler")
 
 # --- Jingles / announcements (optional) ---
-jingle_dir = "#{bindir()}/jingles"
-announce_dir = "#{bindir()}/announcements"
+jingle_dir = "#{storage}/jingles"
+announce_dir = "#{storage}/announcements"
 
 def has_audio(dir) =
   try

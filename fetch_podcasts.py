@@ -2,6 +2,9 @@
 """
 fetch_podcasts.py - Podcast subscription management and episode fetching
 for the liquidsoap radio automation stack.
+
+All data (podcasts, state DBs, logs, playlists) lives under the storage path
+defined in config.json ("storage" key), keeping the boot drive clean.
 """
 
 import argparse
@@ -20,19 +23,36 @@ import requests
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
-STATE_DIR = ROOT / "state"
-SUBS_DB = STATE_DIR / "subscriptions.db"
-PLAYED_DB = STATE_DIR / "played.db"
-PODCASTS_DIR = ROOT / "podcasts"
-LOGS_DIR = ROOT / "logs"
 
 AUDIO_EXTS = {".mp3", ".m4a"}
+
+STATE_DIR = None
+SUBS_DB = None
+PLAYED_DB = None
+PODCASTS_DIR = None
+LOGS_DIR = None
+PLAYLISTS_DIR = None
+
+def load_config():
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def init_paths():
+    """Resolve all data paths from config.json storage key."""
+    global STATE_DIR, SUBS_DB, PLAYED_DB, PODCASTS_DIR, LOGS_DIR, PLAYLISTS_DIR
+    cfg = load_config()
+    storage = Path(cfg["storage"]).expanduser().resolve()
+    STATE_DIR = storage / "state"
+    SUBS_DB = STATE_DIR / "subscriptions.db"
+    PLAYED_DB = STATE_DIR / "played.db"
+    PODCASTS_DIR = storage / "podcasts"
+    LOGS_DIR = storage / "logs"
+    PLAYLISTS_DIR = storage / "playlists"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOGS_DIR / "fetch.log"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -41,9 +61,11 @@ log = logging.getLogger("fetch_podcasts")
 def log_error(msg):
     log.error(msg)
 
-def load_config():
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+def _setup_logging():
+    """Add file handler once LOGS_DIR is known."""
+    fh = logging.FileHandler(LOGS_DIR / "fetch.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(fh)
 
 def open_subs_db():
     conn = sqlite3.connect(SUBS_DB)
@@ -313,7 +335,7 @@ def remove_show_data(slug):
     pod_dir = PODCASTS_DIR / slug
     if pod_dir.exists():
         shutil.rmtree(pod_dir)
-    pls = ROOT / "playlists" / f"{slug}.pls"
+    pls = PLAYLISTS_DIR / f"{slug}.pls"
     if pls.exists():
         pls.unlink()
 
@@ -373,9 +395,12 @@ def main():
     parser.add_argument("--import-opml", metavar="FILE", help="Import shows from an OPML file")
     args = parser.parse_args()
 
-    STATE_DIR.mkdir(exist_ok=True)
-    LOGS_DIR.mkdir(exist_ok=True)
-    PODCASTS_DIR.mkdir(exist_ok=True)
+    init_paths()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
+    PLAYLISTS_DIR.mkdir(parents=True, exist_ok=True)
+    _setup_logging()
 
     config = load_config()
 

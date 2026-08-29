@@ -1,5 +1,112 @@
 [![Hippocratic License HL3-FULL](https://img.shields.io/static/v1?label=Hippocratic%20License&message=HL3-FULL&labelColor=5e2751&color=bc8c3d)](https://firstdonoharm.dev/version/3/0/full.html)
 
+# Radio Automation
+
+Self-hosted internet radio built on **liquidsoap** feeding an **Icecast**
+server, with podcast subscription management via gPodder.net or manual feeds.
+
+Two parallel implementations are provided:
+
+- **Python** (`fetch_podcasts.py`, `update_playlists.py`) — CPython 3, uses
+  `feedparser` and `requests`.
+- **JRuby** (`fetch_podcasts.rb`, `update_playlists.rb`) — JRuby 9.x/10.x,
+  uses only stdlib plus the `sqlite3` gem.
+
+Pick whichever you prefer; both produce identical behaviour and share the
+same `config.json` and `station.liq`.
+
+## Layout
+
+Everything that grows over time (downloaded podcasts, music, jingles,
+announcements, state databases, logs, generated playlists) lives under a
+single **storage path** chosen at install time and recorded in
+`config.json`. The code itself stays in this directory.
+
+    <storage>/
+      music/           # background music library (recursive mp3/m4a scan)
+      podcasts/<slug>/ # downloaded episodes, one folder per show
+      jingles/         # optional bumpers
+      announcements/   # optional station IDs
+      state/
+        subscriptions.db
+        played.db
+      playlists/       # generated per-show .pls files
+      logs/            # fetch.log, update.log, liquidsoap.log, cron.log
+
+The install directory contains only code and configuration:
+
+    fetch_podcasts.py / .rb
+    update_playlists.py / .rb
+    station.liq
+    install_for_python.sh / install_for_jruby.sh
+    config.json          # created by the installer (never committed)
+    schedule.txt         # cron-style scheduled shows (you author this)
+
+## Installing
+
+Run the installer matching your runtime:
+
+    sudo ./install_for_python.sh
+    # or
+    sudo ./install_for_jruby.sh
+
+You will be prompted for:
+
+1. **Storage path** — where all media and state live. Defaults to
+   `/srv/radio-storage`. Choose a disk with plenty of free space; this is
+   what keeps downloads off your boot drive.
+2. **Icecast** source port, mount point, username, and password.
+3. Optionally, **gPodder.net** credentials for automatic subscription sync.
+
+The installer creates the directory tree, writes `config.json` (mode 600),
+installs the `liquidsoap` systemd unit named after this directory, and adds
+two cron jobs:
+
+- Hourly at minute 0: fetch new podcast episodes.
+- Hourly at minute 30: regenerate per-show playlists from playback history.
+
+Start the station with:
+
+    systemctl start <directory-name>
+
+## Managing shows
+
+List registered shows:
+
+    python3 fetch_podcasts.py --list-shows --detail
+    # or
+    jruby fetch_podcasts.rb --list-shows --detail
+
+Add a show directly from a feed URL:
+
+    python3 fetch_podcasts.py --add-show https://example.com/feed.xml
+
+Delete a show and its downloaded data:
+
+    python3 fetch_podcasts.py --delete-show some_slug
+
+Import an OPML export (e.g. from gpodder):
+
+    python3 fetch_podcasts.py --import-opml ~/gpodder_export.opml
+
+Shows imported via OPML are flagged and protected from pruning during
+gPodder sync.
+
+## Playback model
+
+Background music plays continuously. Scheduled shows interrupt the music at
+their appointed times; each scheduled entry in `schedule.txt` needs a
+runlength so the scheduler knows when to hand control back to the music bed.
+Episode runlengths are extracted from RSS enclosure data when available.
+
+Playlists recursively scan nested directories for `.mp3` and `.m4a` files,
+so you can organise your music however you like.
+
+## Notes
+
+- Gems for JRuby should be installed one at a time (separate `gem install`
+  commands); bundling several in one command can hit memory limits.
+- `config.json` is gitignored and contains secrets — keep it mode 600.
 # Radio Automation Stack
 
 A self-hosted internet radio automation system for Linux Mint 22.3 (Ubuntu 24.04 Noble). It continuously plays background music, interrupts it with scheduled podcast shows and external streams, downloads new podcast episodes from RSS feeds, and manages playback history — all fed to an Icecast server via liquidsoap.

@@ -14,12 +14,28 @@ require "optparse"
 module RadioAutomation
   ROOT          = File.expand_path("..", __dir__)
   CONFIG_PATH   = File.join(ROOT, "config.json")
-  STATE_DIR     = File.join(ROOT, "state")
-  SUBS_DB       = File.join(STATE_DIR, "subscriptions.db")
-  PLAYED_DB     = File.join(STATE_DIR, "played.db")
-  PODCASTS_DIR  = File.join(ROOT, "podcasts")
-  LOGS_DIR      = File.join(ROOT, "logs")
   AUDIO_EXTS    = [".mp3", ".m4a"]
+
+  # Resolved at runtime from config.json "storage" key
+  STORAGE_DIR   = nil
+  STATE_DIR     = nil
+  SUBS_DB       = nil
+  PLAYED_DB     = nil
+  PODCASTS_DIR  = nil
+  LOGS_DIR      = nil
+  PLAYLISTS_DIR = nil
+
+  def self.init_paths
+    cfg = JSON.parse(File.read(CONFIG_PATH))
+    @storage = File.expand_path(cfg["storage"])
+    self.STORAGE_DIR   = @storage
+    self.STATE_DIR     = File.join(@storage, "state")
+    self.SUBS_DB       = File.join(STATE_DIR, "subscriptions.db")
+    self.PLAYED_DB     = File.join(STATE_DIR, "played.db")
+    self.PODCASTS_DIR  = File.join(@storage, "podcasts")
+    self.LOGS_DIR      = File.join(@storage, "logs")
+    self.PLAYLISTS_DIR = File.join(@storage, "playlists")
+  end
 
   def self.log_info(msg)
     puts "#{Time.now.iso8601} [INFO] #{msg}"
@@ -47,9 +63,6 @@ module RadioAutomation
     s[0, 60] || "show"
   end
 
-  # ---------------------------------------------------------
-  # Database
-  # ---------------------------------------------------------
   def self.open_subs_db
     db = SQLite3::Database.new(SUBS_DB)
     db.results_as_hash = true
@@ -84,15 +97,11 @@ module RadioAutomation
     db
   end
 
-  # ---------------------------------------------------------
-  # gPodder.net sync
-  # ---------------------------------------------------------
   def self.gpodder_sync(config)
     g = config["gpodder"]
     base = g["host"].chomp("/")
     username = g["username"]
     password = g["password"]
-
     url = "#{base}/subscriptions/#{CGI.escape(username)}.opml"
 
     puts "--- Syncing subscriptions from #{base} ---"
@@ -184,11 +193,7 @@ module RadioAutomation
     removed
   end
 
-  # ---------------------------------------------------------
-  # Feed parsing and download
-  # ---------------------------------------------------------
   def self.extract_duration(entry_xml)
-    # Try media:duration first
     if (m = entry_xml.match(/media:duration[^>]*content="([^"]+)"/))
       val = m[1]
       return val.to_i if val =~ /\A\d+\z/
@@ -197,7 +202,6 @@ module RadioAutomation
         return (h || 0) * 3600 + (mn || 0) * 60 + (s || 0)
       end
     end
-    # Fall back to enclosure length (bytes) -> rough seconds at 128kbps
     if (m = entry_xml.match(/enclosure[^>]*length="(\d+)"/))
       bytes = m[1].to_i
       return (bytes * 8 / 128_000) if bytes > 0
@@ -266,7 +270,6 @@ module RadioAutomation
     subs_db = open_subs_db
     new_count = 0
 
-    # Simple regex-based RSS/Atom entry extraction
     raw.scan(/<(?:item|entry)[^>]*>(.*?)<\/(?:item|entry)>/mi).each do |(entry_xml)|
       guid_m = entry_xml.match(/<guid[^>]*>([^<]*)<\/guid>|<id>([^<]*)<\/id>|<link[^>]*href="([^"]+)"/i)
       guid = guid_m ? (guid_m[1] || guid_m[2] || guid_m[3]).strip : Digest::MD5.hexdigest(entry_xml[0, 200])
@@ -312,9 +315,6 @@ module RadioAutomation
     log_info("=== Fetch complete: #{total_new} new episode(s) ===")
   end
 
-  # ---------------------------------------------------------
-  # Admin operations
-  # ---------------------------------------------------------
   def self.list_shows(detail: false)
     db = open_subs_db
     rows = db.query_all("SELECT slug, name, feed_url, source, opml_import FROM shows ORDER BY name")
@@ -359,7 +359,7 @@ module RadioAutomation
   def self.remove_show_data(slug)
     pod_dir = File.join(PODCASTS_DIR, slug)
     FileUtils.rm_rf(pod_dir) if Dir.exist?(pod_dir)
-    pls = File.join(ROOT, "playlists", "#{slug}.pls")
+    pls = File.join(PLAYLISTS_DIR, "#{slug}.pls")
     File.delete(pls) if File.exist?(pls)
   end
 
@@ -394,9 +394,6 @@ module RadioAutomation
     log_info("OPML import: #{shows.size} show(s) processed.")
   end
 
-  # ---------------------------------------------------------
-  # Main flow
-  # ---------------------------------------------------------
   def self.run_fetch(config)
     g = config["gpodder"]
     if g["enable"] == true
@@ -423,9 +420,11 @@ module RadioAutomation
       opts.on("--import-opml FILE", "Import shows from an OPML file") { |v| options[:import] = v }
     end.parse!
 
+    init_paths
     FileUtils.mkdir_p(STATE_DIR)
     FileUtils.mkdir_p(LOGS_DIR)
     FileUtils.mkdir_p(PODCASTS_DIR)
+    FileUtils.mkdir_p(PLAYLISTS_DIR)
 
     config = load_config
 
