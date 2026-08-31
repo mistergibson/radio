@@ -15,8 +15,8 @@ module RadioAutomation
   ROOT          = File.expand_path("..", __dir__)
   CONFIG_PATH   = File.join(ROOT, "config.json")
   AUDIO_EXTS    = [".mp3", ".m4a"]
+  VIDEO_EXTS    = [".mp4", ".mov", ".avi", ".webm", ".mkv"]
 
-  # Resolved at runtime from config.json "storage" key
   STORAGE_DIR   = nil
   STATE_DIR     = nil
   SUBS_DB       = nil
@@ -39,6 +39,11 @@ module RadioAutomation
 
   def self.log_info(msg)
     puts "#{Time.now.iso8601} [INFO] #{msg}"
+    append_log("fetch.log", msg)
+  end
+
+  def self.log_warning(msg)
+    puts "#{Time.now.iso8601} [WARN] #{msg}"
     append_log("fetch.log", msg)
   end
 
@@ -96,6 +101,47 @@ module RadioAutomation
     SQL
     db
   end
+
+  # --- Audio-only filtering -------------------------------------------------
+
+  def self.enclosure_mime_and_url(entry_xml)
+    enc_m = entry_xml.match(/enclosure[^>]*type="([^"]*)"[^>]*url="([^"]*)"/i) ||
+             entry_xml.match(/enclosure[^>]*url="([^"]*)"[^>]*type="([^"]*)"/i)
+    if enc_m
+      if enc_m.pre_match.include?("type=") && enc_m.post_match.empty?
+        # First pattern matched: group 1 = type, group 2 = url
+        return [enc_m[1], enc_m[2]]
+      else
+        # Second pattern matched: group 1 = url, group 2 = type
+        return [enc_m[2], enc_m[1]]
+      end
+    end
+    # Fallback: just grab url without type
+    url_only = entry_xml.match(/enclosure[^>]*url="([^"]*)"/i)
+    [nil, url_only[1]] if url_only
+  end
+
+  def self.is_audio_entry?(entry_xml)
+    mime, url = enclosure_mime_and_url(entry_xml)
+    return true if mime.nil? && url.nil?  # No enclosure; assume ok
+    mime_l = mime.to_s.downcase
+    return true if mime_l.start_with?("audio/")
+    return false if mime_l.start_with?("video/")
+    # Fall back to URL extension
+    url_l = url.to_s.downcase
+    return true if AUDIO_EXTS.any? { |ext| url_l.end_with?(ext) }
+    return false if VIDEO_EXTS.any? { |ext| url_l.end_with?(ext) }
+    true  # Undetermined: allow
+  end
+
+  def self.is_audio_feed?(raw_xml)
+    # Grab the first <item> or <entry> block
+    m = raw_xml.match(/<(?:item|entry)[^>]*>(.*?)<\/(?:item|entry)>/mi)
+    return true unless m  # No items; let through
+    is_audio_entry?(m[1])
+  end
+
+  # --- End audio-only filtering ---------------------------------------------
 
   def self.gpodder_sync(config)
     g = config["gpodder"]
@@ -161,19 +207,31 @@ module RadioAutomation
   def self.register_remote_shows(remote_shows)
     db = open_subs_db
     added = 0
+    skipped_video = 0
     remote_shows.each do |show|
       slug = slugify(show["name"])
       existing = db.get_first_value("SELECT slug FROM shows WHERE slug = ?", slug)
-      if existing.nil?
-        db.execute(
-          "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
-          [slug, show["name"], show["feed_url"]]
-        )
-        log_info("Registered new show: #{show['name']} (#{slug})")
-        added += 1
+      next unless existing.nil?
+
+      raw = fetch_feed(show["feed_url"])
+      if raw.nil?
+        log_warning("Skipping '#{show['name']}': could not fetch feed.")
+        next
       end
+      unless is_audio_feed?(raw)
+        log_info("Skipping '#{show['name']}' (#{slug}): video podcast, not audio.")
+        skipped_video += 1
+        next
+      end
+      db.execute(
+        "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
+        [slug, show["name"], show["feed_url"]]
+      )
+      log_info("Registered new show: #{show['name']} (#{slug})")
+      added += 1
     end
     db.close
+    log_info("Filtered out #{skipped_video} video podcast(s).") if skipped_video > 0
     added
   end
 
@@ -275,9 +333,13 @@ module RadioAutomation
       guid = guid_m ? (guid_m[1] || guid_m[2] || guid_m[3]).strip : Digest::MD5.hexdigest(entry_xml[0, 200])
       next if seen.include?(guid)
 
-      enc_m = entry_xml.match(/enclosure[^>]*url="([^"]+)"/i)
-      next unless enc_m
-      audio_url = enc_m[1]
+      # Per-episode audio check
+      unless is_audio_entry?(entry_xml)
+        next
+      end
+
+      _, audio_url = enclosure_mime_and_url(entry_xml)
+      next if audio_url.nil?
 
       title_m = entry_xml.match(/<title[^>]*>([^<]*)<\/title>/i)
       title = title_m ? title_m[1].strip : "untitled"
@@ -338,6 +400,10 @@ module RadioAutomation
       log_error("Could not fetch feed: #{feed_url}")
       return
     end
+    unless is_audio_feed?(raw)
+      log_error("Refusing to add: video podcast detected at #{feed_url}")
+      return
+    end
     title_m = raw.match(/<channel[^>]*>\s*<title[^>]*>([^<]*)<\/title>/im) ||
               raw.match(/<feed[^>]*>\s*<title[^>]*>([^<]*)<\/title>/im)
     if title_m.nil?
@@ -383,15 +449,31 @@ module RadioAutomation
     content = File.read(path)
     shows = parse_opml(content)
     db = open_subs_db
+    added = 0
+    skipped_video = 0
     shows.each do |show|
       slug = slugify(show["name"])
+      existing = db.get_first_value("SELECT slug FROM shows WHERE slug = ?", slug)
+      next unless existing.nil?
+
+      raw = fetch_feed(show["feed_url"])
+      if raw.nil?
+        log_warning("OPML import: skipping '#{show['name']}', could not fetch feed.")
+        next
+      end
+      unless is_audio_feed?(raw)
+        log_info("OPML import: skipping '#{show['name']}' (#{slug}): video podcast.")
+        skipped_video += 1
+        next
+      end
       db.execute(
-        "INSERT OR IGNORE INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
+        "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
         [slug, show["name"], show["feed_url"]]
       )
+      added += 1
     end
     db.close
-    log_info("OPML import: #{shows.size} show(s) processed.")
+    log_info("OPML import: #{added} added, #{skipped_video} video shows filtered out.")
   end
 
   def self.run_fetch(config)

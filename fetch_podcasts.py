@@ -5,6 +5,9 @@ for the liquidsoap radio automation stack.
 
 All data (podcasts, state DBs, logs, playlists) lives under the storage path
 defined in config.json ("storage" key), keeping the boot drive clean.
+
+Filters out video podcasts: only shows whose latest enclosure has an
+audio/* MIME type are registered.
 """
 
 import argparse
@@ -105,6 +108,29 @@ def slugify(name):
     s = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
     return s[:60] or "show"
 
+def is_audio_feed(parsed):
+    """Check whether the feed's latest episode has an audio enclosure.
+    Returns True if audio, False if video or unknown.
+    """
+    if not parsed.entries:
+        return True  # No entries yet; let it through, will fail on fetch
+    entry = parsed.entries[0]
+    enclosures = entry.get("enclosures") or []
+    if not enclosures:
+        return True  # No enclosure info; assume audio
+    mime_type = (enclosures[0].get("type") or "").lower()
+    if mime_type.startswith("audio/"):
+        return True
+    if mime_type.startswith("video/"):
+        return False
+    # Unknown type: check URL extension as fallback
+    url = (enclosures[0].get("href") or "").lower()
+    if any(url.endswith(ext) for ext in AUDIO_EXTS):
+        return True
+    if any(url.endswith(ext) for ext in (".mp4", ".mov", ".avi", ".webm", ".mkv")):
+        return False
+    return True  # Default to allowing if undetermined
+
 def gpodder_sync(cfg):
     g = cfg["gpodder"]
     base = g["host"].rstrip("/")
@@ -156,18 +182,31 @@ def parse_opml(xml_string):
 def register_remote_shows(remote_shows):
     db = open_subs_db()
     added = 0
+    skipped_video = 0
     for show in remote_shows:
         slug = slugify(show["name"])
         existing = db.execute("SELECT slug FROM shows WHERE slug = ?", (slug,)).fetchone()
-        if existing is None:
-            db.execute(
-                "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
-                (slug, show["name"], show["feed_url"]),
-            )
-            log.info("Registered new show: %s (%s)", show["name"], slug)
-            added += 1
+        if existing is not None:
+            continue
+        # Audio-only filter: check the feed before registering
+        parsed = fetch_feed(show["feed_url"])
+        if parsed is None:
+            log.warning("Skipping '%s': could not fetch feed.", show["name"])
+            continue
+        if not is_audio_feed(parsed):
+            log.info("Skipping '%s' (%s): video podcast, not audio.", show["name"], slug)
+            skipped_video += 1
+            continue
+        db.execute(
+            "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
+            (slug, show["name"], show["feed_url"]),
+        )
+        log.info("Registered new show: %s (%s)", show["name"], slug)
+        added += 1
     db.commit()
     db.close()
+    if skipped_video:
+        log.info("Filtered out %d video podcast(s).", skipped_video)
     return added
 
 def prune_stale_shows(remote_shows):
@@ -262,6 +301,10 @@ def fetch_show_episodes(slug, name, feed_url):
         enclosures = entry.get("enclosures") or []
         if not enclosures:
             continue
+        # Per-episode audio check (catches mixed-content feeds)
+        mime = (enclosures[0].get("type") or "").lower()
+        if mime.startswith("video/"):
+            continue
         audio_url = enclosures[0].get("href")
         if not audio_url:
             continue
@@ -319,6 +362,9 @@ def add_show(feed_url):
     if parsed is None or not parsed.feed.get("title"):
         log_error(f"Could not determine show title from {feed_url}")
         return
+    if not is_audio_feed(parsed):
+        log_error(f"Refusing to add '{parsed.feed['title']}': video podcast detected.")
+        return
     name = parsed.feed["title"]
     slug = slugify(name)
     db = open_subs_db()
@@ -364,15 +410,29 @@ def import_opml(path):
         return
     shows = parse_opml(content)
     db = open_subs_db()
+    added = 0
+    skipped_video = 0
     for show in shows:
         slug = slugify(show["name"])
+        existing = db.execute("SELECT slug FROM shows WHERE slug = ?", (slug,)).fetchone()
+        if existing is not None:
+            continue
+        parsed = fetch_feed(show["feed_url"])
+        if parsed is None:
+            log.warning("OPML import: skipping '%s', could not fetch feed.", show["name"])
+            continue
+        if not is_audio_feed(parsed):
+            log.info("OPML import: skipping '%s' (%s): video podcast.", show["name"], slug)
+            skipped_video += 1
+            continue
         db.execute(
-            "INSERT OR IGNORE INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
+            "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
             (slug, show["name"], show["feed_url"]),
         )
+        added += 1
     db.commit()
     db.close()
-    log.info("OPML import: %d show(s) processed.", len(shows))
+    log.info("OPML import: %d added, %d video shows filtered out.", added, skipped_video)
 
 def run_fetch(config):
     g = config["gpodder"]
