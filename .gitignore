@@ -2,6 +2,7 @@
 config.json
 
 # Runtime data (should live under the storage path, not here)
+.venv/
 state/
 logs/
 playlists/
