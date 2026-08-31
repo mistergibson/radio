@@ -3,7 +3,8 @@
 # install_for_jruby.sh - Installs the JRuby-based radio automation stack.
 # Same layout as the Python installer but invokes jruby for the scripts.
 # Derives its service name from the containing directory, prompts for a
-# storage path, writes config.json, creates the systemd unit and cron jobs.
+# storage path and Icecast host/port/mount/credentials, writes config.json,
+# creates the systemd unit and cron jobs.
 #
 set -euo pipefail
 
@@ -28,8 +29,10 @@ mkdir -p "${STORAGE_PATH}"/{music,podcasts,jingles,announcements,state,playlists
 chown -R liquidsoap:liquidsoap "${STORAGE_PATH}" 2>/dev/null || true
 
 # --- Collect Icecast credentials ------------------------------------------
-read -rp "Icecast source port [8000]: " IC_PORT
-IC_PORT="${IC_PORT:-8000}"
+read -rp "Icecast host [127.0.0.1]: " IC_HOST
+IC_HOST="${IC_HOST:-127.0.0.1}"
+read -rp "Icecast source port [7777]: " IC_PORT
+IC_PORT="${IC_PORT:-7777}"
 read -rp "Icecast mount [/radio.mp3]: " IC_MOUNT
 IC_MOUNT="${IC_MOUNT:-/radio.mp3}"
 read -rp "Icecast source username [sourceadmin]: " IC_USER
@@ -43,8 +46,12 @@ case "${GPODDER_ENABLE,,}" in
     y|yes)
         read -rp "gPodder host [https://gpodder.net]: " GP_HOST
         GP_HOST="${GP_HOST:-https://gpodder.net}"
+        # Strip trailing slash if the user typed one
+        GP_HOST="${GP_HOST%/}"
         read -rp "gPodder username: " GP_USER
+        GP_USER="${GP_USER:?gPodder username required}"
         read -rsp "gPodder password: " GP_PASS; echo
+        GP_PASS="${GP_PASS:?gPodder password required}"
         GP_JSON=$(jq -n --arg h "$GP_HOST" --arg u "$GP_USER" --arg p "$GP_PASS" \
             '{enable:true, host:$h, username:$u, password:$p}')
         ;;
@@ -58,7 +65,7 @@ cat > "$CONFIG_FILE" <<EOF
 {
   "storage": "${STORAGE_PATH}",
   "icecast": {
-    "host": "127.0.0.1",
+    "host": "${IC_HOST}",
     "port": ${IC_PORT},
     "mount": "${IC_MOUNT}",
     "username": "${IC_USER}",
@@ -109,5 +116,7 @@ echo "  $CRON_PLAYLISTS"
 
 echo ""
 echo "=== Installation complete ==="
-echo "Storage root: ${STORAGE_PATH}"
-echo "Start with: systemctl start ${SERVICE_NAME}"
+echo "Storage root:   ${STORAGE_PATH}"
+echo "JRuby:          ${JRuby_BIN}"
+echo "Start with:     systemctl start ${SERVICE_NAME}"
+echo "Test fetcher:   ${JRuby_BIN} fetch_podcasts.rb --list-shows"

@@ -28,6 +28,8 @@ mkdir -p "${STORAGE_PATH}"/{music,podcasts,jingles,announcements,state,playlists
 chown -R liquidsoap:liquidsoap "${STORAGE_PATH}" 2>/dev/null || true
 
 # --- Collect Icecast credentials ------------------------------------------
+read -rp "Icecast host [127.0.0.1]: " IC_HOST
+IC_HOST="${IC_HOST:-127.0.0.1}"
 read -rp "Icecast source port [7777]: " IC_PORT
 IC_PORT="${IC_PORT:-7777}"
 read -rp "Icecast mount [/radio.mp3]: " IC_MOUNT
@@ -62,7 +64,7 @@ cat > "$CONFIG_FILE" <<EOF
 {
   "storage": "${STORAGE_PATH}",
   "icecast": {
-    "host": "127.0.0.1",
+    "host": "${IC_HOST}",
     "port": ${IC_PORT},
     "mount": "${IC_MOUNT}",
     "username": "${IC_USER}",
