@@ -477,11 +477,24 @@ module RadioAutomation
     fetch_show_episodes(slug, name, feed_url)
   end
 
+  def self.set_archive(slug, value)
+    db = open_subs_db
+    rows = jdb_query(db, "SELECT name FROM shows WHERE slug = ?", [slug])
+    if rows.empty?
+      log_error("No show found with slug '#{slug}'.")
+      return
+    end
+    jdb_exec(db, "UPDATE shows SET archived = ? WHERE slug = ?", [value, slug])
+    db.close
+    state = value == 1 ? "archived" : "non-archived (live)"
+    log_info("Show '#{rows.first['name']}' (#{slug}) is now #{state}.")
+  end
+
   def self.remove_show_data(slug)
     pod_dir = File.join(PODCASTS_DIR, slug)
     FileUtils.rm_rf(pod_dir) if Dir.exist?(pod_dir)
-    pls = File.join(PLAYLISTS_DIR, "#{slug}.pls")
-    File.delete(pls) if File.exist?(pls)
+    txt = File.join(PLAYLISTS_DIR, "#{slug}.txt")
+    File.delete(txt) if File.exist?(txt)
   end
 
   def self.delete_show(slug)
@@ -556,6 +569,8 @@ module RadioAutomation
       opts.on("--detail", "With --list-shows, show feed URLs") { options[:detail] = true }
       opts.on("--add-show FEED_URL", "Add a show from a feed URL") { |v| options[:add] = v }
       opts.on("--delete-show SLUG", "Delete a show and its data") { |v| options[:delete] = v }
+      opts.on("--archive SLUG", "Mark a show as archived (download episodes)") { |v| options[:archive] = v }
+      opts.on("--unarchive SLUG", "Mark a show as non-archived (stream live)") { |v| options[:unarchive] = v }
       opts.on("--import-opml FILE", "Import shows from an OPML file") { |v| options[:import] = v }
     end.parse!
 
@@ -567,7 +582,11 @@ module RadioAutomation
 
     config = load_config
 
-    if options[:list]
+    if options[:archive]
+      set_archive(options[:archive], 1)
+    elsif options[:unarchive]
+      set_archive(options[:unarchive], 0)
+    elsif options[:list]
       list_shows(detail: options[:detail])
     elsif options[:add]
       add_show(options[:add])
