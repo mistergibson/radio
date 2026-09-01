@@ -21,12 +21,27 @@ echo "Install dir: ${SCRIPT_DIR}"
 echo "Using jruby: ${JRuby_BIN}"
 echo ""
 
+# --- Verify required source files exist ------------------------------------
+for req in station.liq fetch_podcasts.rb update_playlists.rb; do
+    if [ ! -f "${SCRIPT_DIR}/${req}" ]; then
+        echo "ERROR: required file '${req}' not found in ${SCRIPT_DIR}" >&2
+        exit 1
+    fi
+done
+
 # --- Prompt for storage path ---------------------------------------------
 DEFAULT_STORAGE="/srv/radio-storage"
 read -rp "Enter storage path for media/state/logs [${DEFAULT_STORAGE}]: " STORAGE_PATH
 STORAGE_PATH="${STORAGE_PATH:-$DEFAULT_STORAGE}"
 mkdir -p "${STORAGE_PATH}"/{music,podcasts,jingles,announcements,state,playlists,logs}
-chown -R liquidsoap:liquidsoap "${STORAGE_PATH}" 2>/dev/null || true
+# Media dirs are read by the liquidsoap user at stream time
+chown -R liquidsoap:liquidsoap "${STORAGE_PATH}"/{music,podcasts,jingles,announcements} 2>/dev/null || true
+# state/ and playlists/ are written by the cron jobs (run as root) and read by liquidsoap
+chown root:liquidsoap "${STORAGE_PATH}"/{state,playlists} 2>/dev/null || true
+chmod 775 "${STORAGE_PATH}"/{state,playlists} 2>/dev/null || true
+# logs/ is appended to by cron
+chown root:liquidsoap "${STORAGE_PATH}/logs" 2>/dev/null || true
+chmod 775 "${STORAGE_PATH}/logs" 2>/dev/null || true
 
 # --- Collect Icecast credentials ------------------------------------------
 read -rp "Icecast host [127.0.0.1]: " IC_HOST
@@ -78,10 +93,12 @@ chmod 600 "$CONFIG_FILE"
 echo "Wrote ${CONFIG_FILE}"
 
 # --- Gem check (install one at a time to avoid memory limits) --------------
-for gem in sqlite3 json; do
+# Use jdbc-sqlite3, not sqlite3: the latter needs a native C extension that
+# fails to build on JRuby. jdbc-sqlite3 ships the SQLite JDBC driver as a JAR.
+for gem in jdbc-sqlite3 json; do
     if ! "${JRuby_BIN}" -e "require '${gem}'" >/dev/null 2>&1; then
         echo "Installing gem: ${gem}"
-        gem install "${gem}"
+        "${JRuby_BIN}" -S gem install "${gem}"
     fi
 done
 
@@ -109,7 +126,9 @@ echo "Enabled systemd unit: ${SERVICE_NAME}"
 CRON_FETCH="0 * * * * cd ${SCRIPT_DIR} && ${JRuby_BIN} fetch_podcasts.rb >> ${STORAGE_PATH}/logs/cron.log 2>&1"
 CRON_PLAYLISTS="30 * * * * cd ${SCRIPT_DIR} && ${JRuby_BIN} update_playlists.rb >> ${STORAGE_PATH}/logs/cron.log 2>&1"
 
-(crontab -l 2>/dev/null | grep -v "fetch_podcasts.rb\|update_playlists.rb"; echo "$CRON_FETCH"; echo "$CRON_PLAYLISTS") | crontab -
+# Guard against pipefail killing us when crontab is empty or has no matching lines
+EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v "fetch_podcasts.rb\|update_playlists.rb" || true)
+( [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_FETCH"; echo "$CRON_PLAYLISTS" ) | crontab -
 echo "Installed cron jobs:"
 echo "  $CRON_FETCH"
 echo "  $CRON_PLAYLISTS"

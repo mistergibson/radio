@@ -5,11 +5,14 @@ require "net/http"
 require "uri"
 require "cgi"
 require "json"
-require "sqlite3"
+require "jdbc/sqlite3"
 require "rexml/document"
 require "digest/md5"
+require "securerandom"
 require "fileutils"
 require "optparse"
+
+Jdbc::SQLite3.load_driver
 
 module RadioAutomation
   ROOT          = File.expand_path("..", __dir__)
@@ -35,6 +38,37 @@ module RadioAutomation
     self.PODCASTS_DIR  = File.join(@storage, "podcasts")
     self.LOGS_DIR      = File.join(@storage, "logs")
     self.PLAYLISTS_DIR = File.join(@storage, "playlists")
+  end
+
+  # --- JDBC connection helpers ---------------------------------------------
+
+  def self.jdb_connect(db_file)
+    java.sql.DriverManager.getConnection("jdbc:sqlite:#{db_file}")
+  end
+
+  def self.jdb_query(conn, sql, params = [])
+    stmt = conn.prepareStatement(sql)
+    params.each_with_index { |p, i| stmt.setObject(i + 1, p) }
+    rs = stmt.executeQuery
+    cols = []
+    meta = rs.getMetaData
+    (1..meta.getColumnCount).each { |i| cols << meta.getColumnName(i) }
+    rows = []
+    while rs.next
+      row = {}
+      cols.each { |c| row[c] = rs.getObject(c) }
+      rows << row
+    end
+    rs.close
+    stmt.close
+    rows
+  end
+
+  def self.jdb_exec(conn, sql, params = [])
+    stmt = conn.prepareStatement(sql)
+    params.each_with_index { |p, i| stmt.setObject(i + 1, p) }
+    stmt.executeUpdate
+    stmt.close
   end
 
   def self.log_info(msg)
@@ -68,16 +102,21 @@ module RadioAutomation
     s[0, 60] || "show"
   end
 
+  def self.gen_uuid
+    SecureRandom.uuid
+  end
+
   def self.open_subs_db
-    db = SQLite3::Database.new(SUBS_DB)
-    db.results_as_hash = true
-    db.execute <<-SQL
+    db = jdb_connect(SUBS_DB)
+    jdb_exec(db, <<-SQL)
       CREATE TABLE IF NOT EXISTS shows (
         slug TEXT PRIMARY KEY,
+        guid TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL,
         feed_url TEXT NOT NULL UNIQUE,
         source TEXT DEFAULT 'manual',
         opml_import INTEGER DEFAULT 0,
+        archived INTEGER DEFAULT 1,
         created_at TEXT DEFAULT (datetime('now'))
       )
     SQL
@@ -85,16 +124,17 @@ module RadioAutomation
   end
 
   def self.open_played_db
-    db = SQLite3::Database.new(PLAYED_DB)
-    db.results_as_hash = true
-    db.execute <<-SQL
+    db = jdb_connect(PLAYED_DB)
+    jdb_exec(db, <<-SQL)
       CREATE TABLE IF NOT EXISTS episodes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         show_slug TEXT NOT NULL,
         guid TEXT NOT NULL,
         title TEXT,
         file_path TEXT,
-        duration_seconds INTEGER,
+        enclosure_url TEXT,
+        runlength INTEGER,
+        played INTEGER DEFAULT 0,
         played_at TEXT,
         UNIQUE(show_slug, guid)
       )
@@ -109,35 +149,30 @@ module RadioAutomation
              entry_xml.match(/enclosure[^>]*url="([^"]*)"[^>]*type="([^"]*)"/i)
     if enc_m
       if enc_m.pre_match.include?("type=") && enc_m.post_match.empty?
-        # First pattern matched: group 1 = type, group 2 = url
         return [enc_m[1], enc_m[2]]
       else
-        # Second pattern matched: group 1 = url, group 2 = type
         return [enc_m[2], enc_m[1]]
       end
     end
-    # Fallback: just grab url without type
     url_only = entry_xml.match(/enclosure[^>]*url="([^"]*)"/i)
     [nil, url_only[1]] if url_only
   end
 
   def self.is_audio_entry?(entry_xml)
     mime, url = enclosure_mime_and_url(entry_xml)
-    return true if mime.nil? && url.nil?  # No enclosure; assume ok
+    return true if mime.nil? && url.nil?
     mime_l = mime.to_s.downcase
     return true if mime_l.start_with?("audio/")
     return false if mime_l.start_with?("video/")
-    # Fall back to URL extension
     url_l = url.to_s.downcase
     return true if AUDIO_EXTS.any? { |ext| url_l.end_with?(ext) }
     return false if VIDEO_EXTS.any? { |ext| url_l.end_with?(ext) }
-    true  # Undetermined: allow
+    true
   end
 
   def self.is_audio_feed?(raw_xml)
-    # Grab the first <item> or <entry> block
     m = raw_xml.match(/<(?:item|entry)[^>]*>(.*?)<\/(?:item|entry)>/mi)
-    return true unless m  # No items; let through
+    return true unless m
     is_audio_entry?(m[1])
   end
 
@@ -195,8 +230,9 @@ module RadioAutomation
     REXML::XPath.each(doc, "//outline[@xmlUrl]") do |node|
       feed_url = node.attributes["xmlUrl"].to_s.strip
       name     = node.attributes["text"].to_s.strip
+      guid     = node.attributes["guid"].to_s.strip
       next unless feed_url =~ /\Ahttps?:\/\//
-      shows << { "name" => name, "feed_url" => feed_url }
+      shows << { "name" => name, "feed_url" => feed_url, "guid" => (guid.empty? ? nil : guid) }
     end
     shows
   rescue REXML::ParseException => e
@@ -210,8 +246,8 @@ module RadioAutomation
     skipped_video = 0
     remote_shows.each do |show|
       slug = slugify(show["name"])
-      existing = db.get_first_value("SELECT slug FROM shows WHERE slug = ?", slug)
-      next unless existing.nil?
+      existing = jdb_query(db, "SELECT slug FROM shows WHERE slug = ?", [slug])
+      next unless existing.empty?
 
       raw = fetch_feed(show["feed_url"])
       if raw.nil?
@@ -223,9 +259,11 @@ module RadioAutomation
         skipped_video += 1
         next
       end
-      db.execute(
-        "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
-        [slug, show["name"], show["feed_url"]]
+      guid = show["guid"] || gen_uuid
+      jdb_exec(
+        db,
+        "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'gpodder', 0, 1)",
+        [slug, guid, show["name"], show["feed_url"]]
       )
       log_info("Registered new show: #{show['name']} (#{slug})")
       added += 1
@@ -238,12 +276,12 @@ module RadioAutomation
   def self.prune_stale_shows(remote_shows)
     db = open_subs_db
     remote_slugs = remote_shows.map { |s| slugify(s["name"]) }
-    stale = db.query_all("SELECT slug, name FROM shows WHERE source = 'gpodder' AND opml_import = 0")
+    stale = jdb_query(db, "SELECT slug, name FROM shows WHERE source = 'gpodder' AND opml_import = 0")
     removed = 0
     stale.each do |row|
       next if remote_slugs.include?(row["slug"])
       remove_show_data(row["slug"])
-      db.execute("DELETE FROM shows WHERE slug = ?", [row["slug"]])
+      jdb_exec(db, "DELETE FROM shows WHERE slug = ?", [row["slug"]])
       log_info("Pruned stale show: #{row['name']} (#{row['slug']})")
       removed += 1
     end
@@ -318,14 +356,21 @@ module RadioAutomation
     "#{name || fallback}.mp3"
   end
 
+  def self.show_archived?(subs_db, slug)
+    rows = jdb_query(subs_db, "SELECT archived FROM shows WHERE slug = ?", [slug])
+    rows.empty? ? true : (rows.first["archived"] == 1)
+  end
+
   def self.fetch_show_episodes(slug, name, feed_url)
     dest_dir = File.join(PODCASTS_DIR, slug)
     raw = fetch_feed(feed_url)
     return 0 if raw.nil?
 
     played_db = open_played_db
-    seen = played_db.query("SELECT guid FROM episodes WHERE show_slug = ?", slug).map { |r| r["guid"] }
+    seen_rows = jdb_query(played_db, "SELECT guid FROM episodes WHERE show_slug = ?", [slug])
+    seen = seen_rows.map { |r| r["guid"] }
     subs_db = open_subs_db
+    archived = show_archived?(subs_db, slug)
     new_count = 0
 
     raw.scan(/<(?:item|entry)[^>]*>(.*?)<\/(?:item|entry)>/mi).each do |(entry_xml)|
@@ -333,7 +378,6 @@ module RadioAutomation
       guid = guid_m ? (guid_m[1] || guid_m[2] || guid_m[3]).strip : Digest::MD5.hexdigest(entry_xml[0, 200])
       next if seen.include?(guid)
 
-      # Per-episode audio check
       unless is_audio_entry?(entry_xml)
         next
       end
@@ -343,17 +387,26 @@ module RadioAutomation
 
       title_m = entry_xml.match(/<title[^>]*>([^<]*)<\/title>/i)
       title = title_m ? title_m[1].strip : "untitled"
-      filename = safe_filename(title, guid[-20..])
-      file_path = download_episode(audio_url, dest_dir, filename)
-      next if file_path.nil?
-
       duration = extract_duration(entry_xml)
-      played_db.execute(
-        "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, duration_seconds, played_at) VALUES (?, ?, ?, ?, ?, NULL)",
-        [slug, guid, title, file_path, duration]
-      )
+
+      if archived
+        filename = safe_filename(title, guid[-20..])
+        file_path = download_episode(audio_url, dest_dir, filename)
+        next if file_path.nil?
+        jdb_exec(
+          played_db,
+          "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, enclosure_url, runlength, played) VALUES (?, ?, ?, ?, ?, ?, 0)",
+          [slug, guid, title, file_path, audio_url, duration]
+        )
+      else
+        jdb_exec(
+          played_db,
+          "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, enclosure_url, runlength, played) VALUES (?, ?, ?, NULL, ?, ?, 0)",
+          [slug, guid, title, audio_url, duration]
+        )
+      end
       new_count += 1
-      log_info("  New episode: #{title} [#{filename}]")
+      log_info("  New episode: #{title} [#{archived ? 'downloaded' : 'live'}]")
     end
 
     played_db.close
@@ -363,7 +416,7 @@ module RadioAutomation
 
   def self.fetch_all_episodes
     db = open_subs_db
-    shows = db.query_all("SELECT slug, name, feed_url FROM shows ORDER BY name")
+    shows = jdb_query(db, "SELECT slug, name, feed_url FROM shows ORDER BY name")
     db.close
     total_new = 0
     shows.each do |show|
@@ -379,16 +432,16 @@ module RadioAutomation
 
   def self.list_shows(detail: false)
     db = open_subs_db
-    rows = db.query_all("SELECT slug, name, feed_url, source, opml_import FROM shows ORDER BY name")
+    rows = jdb_query(db, "SELECT slug, name, feed_url, source, opml_import, archived FROM shows ORDER BY name")
     db.close
     if rows.empty?
       puts "No shows registered."
       return
     end
-    puts format("%-30s %-10s %s", "SLUG", "PROTECTED", "NAME")
+    puts format("%-30s %-10s %-8s %s", "SLUG", "ARCHIVED", "SOURCE", "NAME")
     rows.each do |r|
-      prot = r["opml_import"] ? "yes" : "no"
-      line = format("%-30s %-10s %s", r["slug"], prot, r["name"])
+      arch = r["archived"] == 1 ? "yes" : "no"
+      line = format("%-30s %-10s %-8s %s", r["slug"], arch, r["source"], r["name"])
       line += "\n" + (" " * 50) + r["feed_url"] if detail
       puts line
     end
@@ -412,10 +465,12 @@ module RadioAutomation
     end
     name = title_m[1].strip
     slug = slugify(name)
+    guid = gen_uuid
     db = open_subs_db
-    db.execute(
-      "INSERT OR IGNORE INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'manual', 0)",
-      [slug, name, feed_url]
+    jdb_exec(
+      db,
+      "INSERT OR IGNORE INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'manual', 0, 1)",
+      [slug, guid, name, feed_url]
     )
     db.close
     log_info("Added show: #{name} (#{slug})")
@@ -431,18 +486,18 @@ module RadioAutomation
 
   def self.delete_show(slug)
     db = open_subs_db
-    row = db.get_first_hash("SELECT name FROM shows WHERE slug = ?", slug)
-    if row.nil?
+    rows = jdb_query(db, "SELECT name FROM shows WHERE slug = ?", [slug])
+    if rows.empty?
       log_error("No show found with slug '#{slug}'.")
       return
     end
     remove_show_data(slug)
-    db.execute("DELETE FROM shows WHERE slug = ?", [slug])
+    jdb_exec(db, "DELETE FROM shows WHERE slug = ?", [slug])
     db.close
     played_db = open_played_db
-    played_db.execute("DELETE FROM episodes WHERE show_slug = ?", [slug])
+    jdb_exec(played_db, "DELETE FROM episodes WHERE show_slug = ?", [slug])
     played_db.close
-    log_info("Deleted show: #{row['name']} (#{slug})")
+    log_info("Deleted show: #{rows.first['name']} (#{slug})")
   end
 
   def self.import_opml(path)
@@ -453,8 +508,8 @@ module RadioAutomation
     skipped_video = 0
     shows.each do |show|
       slug = slugify(show["name"])
-      existing = db.get_first_value("SELECT slug FROM shows WHERE slug = ?", slug)
-      next unless existing.nil?
+      existing = jdb_query(db, "SELECT slug FROM shows WHERE slug = ?", [slug])
+      next unless existing.empty?
 
       raw = fetch_feed(show["feed_url"])
       if raw.nil?
@@ -466,9 +521,11 @@ module RadioAutomation
         skipped_video += 1
         next
       end
-      db.execute(
-        "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
-        [slug, show["name"], show["feed_url"]]
+      guid = show["guid"] || gen_uuid
+      jdb_exec(
+        db,
+        "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'opml', 1, 1)",
+        [slug, guid, show["name"], show["feed_url"]]
       )
       added += 1
     end

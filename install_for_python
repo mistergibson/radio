@@ -20,12 +20,27 @@ echo "=== ${SERVICE_NAME} installer (Python) ==="
 echo "Install dir: ${SCRIPT_DIR}"
 echo ""
 
+# --- Verify required source files exist ------------------------------------
+for req in station.liq fetch_podcasts.py update_playlists.py; do
+    if [ ! -f "${SCRIPT_DIR}/${req}" ]; then
+        echo "ERROR: required file '${req}' not found in ${SCRIPT_DIR}" >&2
+        exit 1
+    fi
+done
+
 # --- Prompt for storage path ---------------------------------------------
 DEFAULT_STORAGE="/srv/radio-storage"
 read -rp "Enter storage path for media/state/logs [${DEFAULT_STORAGE}]: " STORAGE_PATH
 STORAGE_PATH="${STORAGE_PATH:-$DEFAULT_STORAGE}"
 mkdir -p "${STORAGE_PATH}"/{music,podcasts,jingles,announcements,state,playlists,logs}
-chown -R liquidsoap:liquidsoap "${STORAGE_PATH}" 2>/dev/null || true
+# Media dirs are read by the liquidsoap user at stream time
+chown -R liquidsoap:liquidsoap "${STORAGE_PATH}"/{music,podcasts,jingles,announcements} 2>/dev/null || true
+# state/ and playlists/ are written by the cron jobs (run as root) and read by liquidsoap
+chown root:liquidsoap "${STORAGE_PATH}"/{state,playlists} 2>/dev/null || true
+chmod 775 "${STORAGE_PATH}"/{state,playlists} 2>/dev/null || true
+# logs/ is appended to by cron
+chown root:liquidsoap "${STORAGE_PATH}/logs" 2>/dev/null || true
+chmod 775 "${STORAGE_PATH}/logs" 2>/dev/null || true
 
 # --- Collect Icecast credentials ------------------------------------------
 read -rp "Icecast host [127.0.0.1]: " IC_HOST
@@ -111,7 +126,9 @@ echo "Enabled systemd unit: ${SERVICE_NAME}"
 CRON_FETCH="0 * * * * cd ${SCRIPT_DIR} && ${PYBIN} fetch_podcasts.py >> ${STORAGE_PATH}/logs/cron.log 2>&1"
 CRON_PLAYLISTS="30 * * * * cd ${SCRIPT_DIR} && ${PYBIN} update_playlists.py >> ${STORAGE_PATH}/logs/cron.log 2>&1"
 
-(crontab -l 2>/dev/null | grep -v "fetch_podcasts.py\|update_playlists.py"; echo "$CRON_FETCH"; echo "$CRON_PLAYLISTS") | crontab -
+# Guard against pipefail killing us when crontab is empty or has no matching lines
+EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v "fetch_podcasts.py\|update_playlists.py" || true)
+( [ -n "$EXISTING_CRON" ] && echo "$EXISTING_CRON"; echo "$CRON_FETCH"; echo "$CRON_PLAYLISTS" ) | crontab -
 echo "Installed cron jobs:"
 echo "  $CRON_FETCH"
 echo "  $CRON_PLAYLISTS"

@@ -8,6 +8,9 @@ defined in config.json ("storage" key), keeping the boot drive clean.
 
 Filters out video podcasts: only shows whose latest enclosure has an
 audio/* MIME type are registered.
+
+Archived shows (archived=1) have episodes downloaded to disk; non-archived
+shows (archived=0) store only the enclosure URL for live streaming.
 """
 
 import argparse
@@ -17,6 +20,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
@@ -28,6 +32,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 
 AUDIO_EXTS = {".mp3", ".m4a"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
 
 STATE_DIR = None
 SUBS_DB = None
@@ -76,10 +81,12 @@ def open_subs_db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS shows (
             slug TEXT PRIMARY KEY,
+            guid TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
             feed_url TEXT NOT NULL UNIQUE,
             source TEXT DEFAULT 'manual',
             opml_import INTEGER DEFAULT 0,
+            archived INTEGER DEFAULT 1,
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -96,8 +103,10 @@ def open_played_db():
             guid TEXT NOT NULL,
             title TEXT,
             file_path TEXT,
-            duration_seconds INTEGER,
-            played_at TEXT DEFAULT (datetime('now')),
+            enclosure_url TEXT,
+            runlength INTEGER,
+            played INTEGER DEFAULT 0,
+            played_at TEXT,
             UNIQUE(show_slug, guid)
         )
     """)
@@ -107,6 +116,9 @@ def open_played_db():
 def slugify(name):
     s = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
     return s[:60] or "show"
+
+def gen_uuid():
+    return str(uuid.uuid4())
 
 def is_audio_feed(parsed):
     """Check whether the feed's latest episode has an audio enclosure.
@@ -123,13 +135,12 @@ def is_audio_feed(parsed):
         return True
     if mime_type.startswith("video/"):
         return False
-    # Unknown type: check URL extension as fallback
     url = (enclosures[0].get("href") or "").lower()
     if any(url.endswith(ext) for ext in AUDIO_EXTS):
         return True
-    if any(url.endswith(ext) for ext in (".mp4", ".mov", ".avi", ".webm", ".mkv")):
+    if any(url.endswith(ext) for ext in VIDEO_EXTS):
         return False
-    return True  # Default to allowing if undetermined
+    return True
 
 def gpodder_sync(cfg):
     g = cfg["gpodder"]
@@ -174,9 +185,14 @@ def parse_opml(xml_string):
     for outline in root.iter("outline"):
         feed_url = (outline.attrib.get("xmlUrl") or "").strip()
         name = (outline.attrib.get("text") or "").strip()
+        guid = (outline.attrib.get("guid") or "").strip()
         if not feed_url or not re.match(r"^https?://", feed_url):
             continue
-        shows.append({"name": name, "feed_url": feed_url})
+        shows.append({
+            "name": name,
+            "feed_url": feed_url,
+            "guid": guid if guid else None,
+        })
     return shows
 
 def register_remote_shows(remote_shows):
@@ -188,7 +204,6 @@ def register_remote_shows(remote_shows):
         existing = db.execute("SELECT slug FROM shows WHERE slug = ?", (slug,)).fetchone()
         if existing is not None:
             continue
-        # Audio-only filter: check the feed before registering
         parsed = fetch_feed(show["feed_url"])
         if parsed is None:
             log.warning("Skipping '%s': could not fetch feed.", show["name"])
@@ -197,9 +212,10 @@ def register_remote_shows(remote_shows):
             log.info("Skipping '%s' (%s): video podcast, not audio.", show["name"], slug)
             skipped_video += 1
             continue
+        guid = show["guid"] or gen_uuid()
         db.execute(
-            "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'gpodder', 0)",
-            (slug, show["name"], show["feed_url"]),
+            "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'gpodder', 0, 1)",
+            (slug, guid, show["name"], show["feed_url"]),
         )
         log.info("Registered new show: %s (%s)", show["name"], slug)
         added += 1
@@ -281,6 +297,12 @@ def safe_filename(title, fallback):
     name = re.sub(r"[^\w\s.-]", "", title or "").strip().replace(" ", "_")
     return (name[:120] or fallback) + ".mp3"
 
+def show_archived(subs_db, slug):
+    row = subs_db.execute("SELECT archived FROM shows WHERE slug = ?", (slug,)).fetchone()
+    if row is None:
+        return True
+    return row["archived"] == 1
+
 def fetch_show_episodes(slug, name, feed_url):
     dest_dir = PODCASTS_DIR / slug
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +315,7 @@ def fetch_show_episodes(slug, name, feed_url):
         for row in played_db.execute("SELECT guid FROM episodes WHERE show_slug = ?", (slug,))
     }
     subs_db = open_subs_db()
+    archived = show_archived(subs_db, slug)
     new_count = 0
     for entry in parsed.entries:
         guid = entry.get("id") or entry.get("link") or entry.get("title", "")
@@ -301,7 +324,6 @@ def fetch_show_episodes(slug, name, feed_url):
         enclosures = entry.get("enclosures") or []
         if not enclosures:
             continue
-        # Per-episode audio check (catches mixed-content feeds)
         mime = (enclosures[0].get("type") or "").lower()
         if mime.startswith("video/"):
             continue
@@ -309,18 +331,27 @@ def fetch_show_episodes(slug, name, feed_url):
         if not audio_url:
             continue
         title = entry.get("title", "untitled")
-        filename = safe_filename(title, guid[-20:])
-        file_path = download_episode(audio_url, dest_dir, filename)
-        if file_path is None:
-            continue
         duration = extract_duration(entry)
-        played_db.execute(
-            "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, duration_seconds, played_at) "
-            "VALUES (?, ?, ?, ?, ?, NULL)",
-            (slug, guid, title, file_path, duration),
-        )
+
+        if archived:
+            filename = safe_filename(title, guid[-20:])
+            file_path = download_episode(audio_url, dest_dir, filename)
+            if file_path is None:
+                continue
+            played_db.execute(
+                "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, enclosure_url, runlength, played) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (slug, guid, title, file_path, audio_url, duration),
+            )
+        else:
+            played_db.execute(
+                "INSERT OR IGNORE INTO episodes (show_slug, guid, title, file_path, enclosure_url, runlength, played) "
+                "VALUES (?, ?, ?, NULL, ?, ?, 0)",
+                (slug, guid, title, audio_url, duration),
+            )
         new_count += 1
-        log.info("  New episode: %s [%s]", title, filename)
+        kind = "downloaded" if archived else "live"
+        log.info("  New episode: %s [%s]", title, kind)
     played_db.commit()
     played_db.close()
     subs_db.close()
@@ -343,16 +374,16 @@ def fetch_all_episodes():
 def list_shows(detail=False):
     db = open_subs_db()
     rows = db.execute(
-        "SELECT slug, name, feed_url, source, opml_import FROM shows ORDER BY name"
+        "SELECT slug, name, feed_url, source, opml_import, archived FROM shows ORDER BY name"
     ).fetchall()
     db.close()
     if not rows:
         print("No shows registered.")
         return
-    print(f"{'SLUG':<30} {'PROTECTED':<10} NAME")
+    print(f"{'SLUG':<30} {'ARCHIVED':<10} {'SOURCE':<10} NAME")
     for r in rows:
-        prot = "yes" if r["opml_import"] else "no"
-        line = f"{r['slug']:<30} {prot:<10} {r['name']}"
+        arch = "yes" if r["archived"] == 1 else "no"
+        line = f"{r['slug']:<30} {arch:<10} {r['source']:<10} {r['name']}"
         if detail:
             line += f"\n{'':<50} {r['feed_url']}"
         print(line)
@@ -367,10 +398,11 @@ def add_show(feed_url):
         return
     name = parsed.feed["title"]
     slug = slugify(name)
+    guid = gen_uuid()
     db = open_subs_db()
     db.execute(
-        "INSERT OR IGNORE INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'manual', 0)",
-        (slug, name, feed_url),
+        "INSERT OR IGNORE INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'manual', 0, 1)",
+        (slug, guid, name, feed_url),
     )
     db.commit()
     db.close()
@@ -381,7 +413,7 @@ def remove_show_data(slug):
     pod_dir = PODCASTS_DIR / slug
     if pod_dir.exists():
         shutil.rmtree(pod_dir)
-    pls = PLAYLISTS_DIR / f"{slug}.pls"
+    pls = PLAYLISTS_DIR / f"{slug}.txt"
     if pls.exists():
         pls.unlink()
 
@@ -425,9 +457,10 @@ def import_opml(path):
             log.info("OPML import: skipping '%s' (%s): video podcast.", show["name"], slug)
             skipped_video += 1
             continue
+        guid = show["guid"] or gen_uuid()
         db.execute(
-            "INSERT INTO shows (slug, name, feed_url, source, opml_import) VALUES (?, ?, ?, 'opml', 1)",
-            (slug, show["name"], show["feed_url"]),
+            "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'opml', 1, 1)",
+            (slug, guid, show["name"], show["feed_url"]),
         )
         added += 1
     db.commit()

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-update_playlists.py - Regenerate per-show .pls playlists based on playback history.
-Runs via cron hourly at :30. All data under the storage path from config.json.
+update_playlists.py - Select the next unplayed episode per show and write an
+annotated URI line for station.liq to consume. Runs via cron hourly at :30.
+
+Selection is driven by the episodes table (keyed on guid + played flag), not
+by scanning the filesystem, so it works identically for archived shows
+(local file_path) and live shows (remote enclosure_url). All data under the
+storage path from config.json.
 """
 
 import argparse
@@ -13,8 +18,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
-
-AUDIO_EXTS = {".mp3", ".m4a"}
 
 STATE_DIR = None
 SUBS_DB = None
@@ -55,6 +58,19 @@ def _setup_logging():
 def open_subs_db():
     conn = sqlite3.connect(SUBS_DB)
     conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS shows (
+            slug TEXT PRIMARY KEY,
+            guid TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            feed_url TEXT NOT NULL UNIQUE,
+            source TEXT DEFAULT 'manual',
+            opml_import INTEGER DEFAULT 0,
+            archived INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
     return conn
 
 def open_played_db():
@@ -67,7 +83,9 @@ def open_played_db():
             guid TEXT NOT NULL,
             title TEXT,
             file_path TEXT,
-            duration_seconds INTEGER,
+            enclosure_url TEXT,
+            runlength INTEGER,
+            played INTEGER DEFAULT 0,
             played_at TEXT,
             UNIQUE(show_slug, guid)
         )
@@ -75,60 +93,64 @@ def open_played_db():
     conn.commit()
     return conn
 
-def find_audio_files(directory):
-    results = []
-    if not directory.exists():
-        return results
-    for p in sorted(directory.rglob("*")):
-        if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
-            results.append(str(p))
-    return results
-
 def select_unplayed_episode(slug, played_db):
-    files = find_audio_files(PODCASTS_DIR / slug)
-    if not files:
-        return None
-    played_rows = played_db.execute(
-        "SELECT file_path, played_at FROM episodes WHERE show_slug = ? AND played_at IS NOT NULL",
+    """Pick the next unplayed episode for a show, keyed by guid.
+    Archived -> local file_path; Live -> remote enclosure_url."""
+    row = played_db.execute(
+        "SELECT guid, title, file_path, enclosure_url, runlength "
+        "FROM episodes WHERE show_slug = ? AND played = 0 ORDER BY id ASC LIMIT 1",
         (slug,),
-    ).fetchall()
-    played_paths = {row["file_path"]: row["played_at"] for row in played_rows}
-    unplayed = [f for f in files if f not in played_paths]
-    if unplayed:
-        return unplayed[0]
-    if played_paths:
-        return min(played_paths.items(), key=lambda kv: (kv[1] or ""))[0]
-    return files[0]
+    ).fetchone()
+    return row
 
-def write_pls(filepath, out_path):
-    abs_path = str(Path(filepath).resolve())
-    content = f"[playlist]\nFile1={abs_path}\nTitle1=Radio Episode\nLength1=-1\nNumberOfEntries=1\nVersion=2\n"
+def annotated_uri(ep):
+    """Build the annotate: URI line station.liq consumes.
+    Archived -> local file path; Live -> remote enclosure URL."""
+    uri = ep["file_path"] or ep["enclosure_url"]
+    if not uri:
+        return None
+    rl = int(ep["runlength"] or 0)
+    title = (ep["title"] or "").replace('"', "'")
+    return f'annotate:liq_runlength="{rl}",liq_title="{title}":{uri}'
+
+def write_queue_line(slug, line, out_path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(content)
+    out_path.write_text(line + "\n")
 
-def mark_as_played(slug, filepath, played_db):
+def mark_as_played(slug, guid, played_db):
     played_db.execute(
-        "UPDATE episodes SET played_at = datetime('now') WHERE show_slug = ? AND file_path = ?",
-        (slug, filepath),
+        "UPDATE episodes SET played = 1, played_at = datetime('now') WHERE show_slug = ? AND guid = ?",
+        (slug, guid),
     )
     played_db.commit()
 
 def update_all():
     subs_db = open_subs_db()
     played_db = open_played_db()
-    shows = subs_db.execute("SELECT slug, name FROM shows ORDER BY name").fetchall()
+    shows = subs_db.execute("SELECT slug, name, archived FROM shows ORDER BY name").fetchall()
+    queued = 0
+    skipped = 0
     for show in shows:
         slug = show["slug"]
-        selected = select_unplayed_episode(slug, played_db)
-        if selected is None:
-            log.info("%s: no audio files found, skipping.", slug)
+        ep = select_unplayed_episode(slug, played_db)
+        if ep is None:
+            log.info("%s: no unplayed episodes, skipping.", slug)
+            skipped += 1
             continue
-        out_pls = PLAYLISTS_DIR / f"{slug}.pls"
-        write_pls(selected, out_pls)
-        mark_as_played(slug, selected, played_db)
-        log.info("%s: queued %s", slug, Path(selected).name)
+        line = annotated_uri(ep)
+        if line is None:
+            log.info("%s: episode %s has no usable URI, skipping.", slug, ep["guid"])
+            skipped += 1
+            continue
+        out_txt = PLAYLISTS_DIR / f"{slug}.txt"
+        write_queue_line(slug, line, out_txt)
+        mark_as_played(slug, ep["guid"], played_db)
+        kind = "downloaded" if ep["file_path"] else "live"
+        log.info("%s: queued %s [%s] runlength=%ss", slug, ep["title"], kind, int(ep["runlength"] or 0))
+        queued += 1
     subs_db.close()
     played_db.close()
+    log.info("=== Update complete: %d queued, %d skipped ===", queued, skipped)
 
 def json_summary():
     subs_db = open_subs_db()
@@ -137,12 +159,13 @@ def json_summary():
     summary = {}
     for show in shows:
         slug = show["slug"]
-        files = find_audio_files(PODCASTS_DIR / slug)
-        played_count = played_db.execute(
-            "SELECT COUNT(*) as c FROM episodes WHERE show_slug = ? AND played_at IS NOT NULL",
-            (slug,),
+        total = played_db.execute(
+            "SELECT COUNT(*) as c FROM episodes WHERE show_slug = ?", (slug,)
         ).fetchone()["c"]
-        summary[slug] = {"total_files": len(files), "played_count": played_count}
+        played = played_db.execute(
+            "SELECT COUNT(*) as c FROM episodes WHERE show_slug = ? AND played = 1", (slug,)
+        ).fetchone()["c"]
+        summary[slug] = {"total_episodes": total, "played_count": played, "unplayed": total - played}
     subs_db.close()
     played_db.close()
     print(json.dumps(summary, indent=2))
