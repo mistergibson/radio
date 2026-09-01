@@ -6,6 +6,12 @@
 # relative config.json path resolves correctly; media lives under
 # the storage path read from that file. Directory playlists scan
 # recursively for audio files automatically.
+#
+# JINGLE/ANNOUNCEMENT NOTE:
+# random() stalls when one branch is permanently down (empty dir).
+# Until jingles/announcements directories contain audio files,
+# they are excluded from the graph. Uncomment the relevant lines
+# below once you've added content to those folders.
 # ---------------------------------------------------------------
 
 set("log.stdout", true)
@@ -38,52 +44,28 @@ set("log.file.path", "#{storage}/logs/liquidsoap.log")
 
 # --- Background music library (directory scanned recursively) --
 music_playlist =
-  playlist("#{storage}/music")
+  mksafe(playlist("#{storage}/music"))
 
 # --- Scheduled content: request queue fed by schedule.txt ------
 sched_queue = request.queue(id="scheduler")
 
-# --- Helper: check if a directory contains any audio files -----
-def has_audio(dir) =
-  try
-    let entries = file.ls(dir)
-    let audio_count = list.length(
-      list.filter(fun(f) -> regexp("\\.(mp3|m4a)$").test(f), entries)
-    )
-    audio_count > 0
-  catch _ do
-    false
-  end
-
-# --- Jingles / announcements (only active if they have content) ---
-jingles_active = has_audio("#{storage}/jingles")
-announcements_active = has_audio("#{storage}/announcements")
-
-log("#[info] Jingles directory has audio: #{string(jingles_active)}")
-log("#[info] Announcements directory has audio: #{string(announcements_active)}")
+# --- Jingles / announcements (uncomment when dirs have content) ---
+# jingles_src =
+#   mksafe(playlist("#{storage}/jingles"))
+#
+# announcements_src =
+#   mksafe(playlist("#{storage}/announcements"))
 
 # --- Assemble the stream ---------------------------------------
 primary = fallback(track_sensitive=false, [sched_queue, music_playlist])
 
-content =
-  if jingles_active then
-    random(weights=[1, 8], [
-      mksafe(playlist("#{storage}/jingles")),
-      primary
-    ])
-  else
-    primary
-  end
+# When jingles are active, uncomment this and comment out the line below:
+# content = random(weights=[1, 8], [jingles_src, primary])
+content = primary
 
-final_content =
-  if announcements_active then
-    fallback(track_sensitive=false, [
-      mksafe(playlist("#{storage}/announcements")),
-      content
-    ])
-  else
-    content
-  end
+# When announcements are active, uncomment this and comment out the line below:
+# final_content = fallback(track_sensitive=false, [announcements_src, content])
+final_content = content
 
 radio = normalize(final_content)
 
