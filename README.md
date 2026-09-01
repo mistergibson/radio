@@ -1,115 +1,8 @@
 [![Hippocratic License HL3-FULL](https://img.shields.io/static/v1?label=Hippocratic%20License&message=HL3-FULL&labelColor=5e2751&color=bc8c3d)](https://firstdonoharm.dev/version/3/0/full.html)
 
-# Radio Automation
-
-Self-hosted internet radio built on **liquidsoap** feeding an **Icecast**
-server, with podcast subscription management via gPodder.net or manual feeds.
-
-Two parallel implementations are provided:
-
-- **Python** (`fetch_podcasts.py`, `update_playlists.py`) — CPython 3, uses
-  `feedparser` and `requests`.
-- **JRuby** (`fetch_podcasts.rb`, `update_playlists.rb`) — JRuby 9.x/10.x,
-  uses only stdlib plus the `sqlite3` gem.
-
-Pick whichever you prefer; both produce identical behaviour and share the
-same `config.json` and `station.liq`.
-
-## Layout
-
-Everything that grows over time (downloaded podcasts, music, jingles,
-announcements, state databases, logs, generated playlists) lives under a
-single **storage path** chosen at install time and recorded in
-`config.json`. The code itself stays in this directory.
-
-    <storage>/
-      music/           # background music library (recursive mp3/m4a scan)
-      podcasts/<slug>/ # downloaded episodes, one folder per show
-      jingles/         # optional bumpers
-      announcements/   # optional station IDs
-      state/
-        subscriptions.db
-        played.db
-      playlists/       # generated per-show .pls files
-      logs/            # fetch.log, update.log, liquidsoap.log, cron.log
-
-The install directory contains only code and configuration:
-
-    fetch_podcasts.py / .rb
-    update_playlists.py / .rb
-    station.liq
-    install_for_python.sh / install_for_jruby.sh
-    config.json          # created by the installer (never committed)
-    schedule.txt         # cron-style scheduled shows (you author this)
-
-## Installing
-
-Run the installer matching your runtime:
-
-    sudo ./install_for_python.sh
-    # or
-    sudo ./install_for_jruby.sh
-
-You will be prompted for:
-
-1. **Storage path** — where all media and state live. Defaults to
-   `/srv/radio-storage`. Choose a disk with plenty of free space; this is
-   what keeps downloads off your boot drive.
-2. **Icecast** source port, mount point, username, and password.
-3. Optionally, **gPodder.net** credentials for automatic subscription sync.
-
-The installer creates the directory tree, writes `config.json` (mode 600),
-installs the `liquidsoap` systemd unit named after this directory, and adds
-two cron jobs:
-
-- Hourly at minute 0: fetch new podcast episodes.
-- Hourly at minute 30: regenerate per-show playlists from playback history.
-
-Start the station with:
-
-    systemctl start <directory-name>
-
-## Managing shows
-
-List registered shows:
-
-    python3 fetch_podcasts.py --list-shows --detail
-    # or
-    jruby fetch_podcasts.rb --list-shows --detail
-
-Add a show directly from a feed URL:
-
-    python3 fetch_podcasts.py --add-show https://example.com/feed.xml
-
-Delete a show and its downloaded data:
-
-    python3 fetch_podcasts.py --delete-show some_slug
-
-Import an OPML export (e.g. from gpodder):
-
-    python3 fetch_podcasts.py --import-opml ~/gpodder_export.opml
-
-Shows imported via OPML are flagged and protected from pruning during
-gPodder sync.
-
-## Playback model
-
-Background music plays continuously. Scheduled shows interrupt the music at
-their appointed times; each scheduled entry in `schedule.txt` needs a
-runlength so the scheduler knows when to hand control back to the music bed.
-Episode runlengths are extracted from RSS enclosure data when available.
-
-Playlists recursively scan nested directories for `.mp3` and `.m4a` files,
-so you can organise your music however you like.
-
-## Notes
-
-- Gems for JRuby should be installed one at a time (separate `gem install`
-  commands); bundling several in one command can hit memory limits.
-- `config.json` is gitignored and contains secrets — keep it mode 600.
 # Radio Automation Stack
 
-A self-hosted internet radio automation system for Linux Mint 22.3 (Ubuntu 24.04 Noble). It continuously plays background music, interrupts it with scheduled podcast shows and external streams, downloads new podcast episodes from RSS feeds, and manages playback history — all fed to an Icecast server via liquidsoap.
+A self-hosted internet radio automation system for Linux Mint 22.3 (Ubuntu 24.04 Noble). It continuously plays background music, interrupts it with scheduled podcast shows and external streams, downloads new podcast episodes from RSS feeds (or stores them as live-stream references), and manages playback history — all fed to an Icecast server via liquidsoap.
 
 Two complete, interchangeable implementations are provided:
 
@@ -124,14 +17,14 @@ Both read the same `config.json`, `schedule.txt`, and directory layout, and prod
                  ┌──────────────┐
    schedule.txt ─▶│              │
    config.json ──▶│  liquidsoap  ├──▶ Icecast /audio.mp3 ──▶ listeners
-   station.liq ──▶│  (radio.service)│
+   station.liq ──▶│  (<svc>.service)│
                  │              │
-   playlists/*.pls ◀── update_playlists.{py,rb}
+   playlists/*.txt ◀── update_playlists.{py,rb}
         ▲                        │
         │ selects unplayed       ▼
-   podcasts/<slug>/      state/played.db   (playback history)
+   podcasts/<slug>/      state/played.db    (episode records + played flag)
         ▲
-        │ downloads new episodes
+        │ downloads archived episodes
    fetch_podcasts.{py,rb}  ──▶ state/subscriptions.db  (show registry)
         ▲
    OPML file / gpodder.net sync
@@ -140,30 +33,33 @@ Both read the same `config.json`, `schedule.txt`, and directory layout, and prod
 The moving parts:
 
 - **liquidsoap** (`station.liq`) runs as a systemd service, streams MP3 to Icecast, and switches between continuous background music and scheduled content.
-- **fetch_podcasts** (cron, hourly) registers shows, pulls new episode metadata from RSS, and downloads audio into `podcasts/<slug>/`.
-- **update_playlists** (cron, hourly at :30) picks one unplayed episode per show, writes a `.pls` playlist, and records it as played.
+- **fetch_podcasts** (cron, hourly at :00) registers shows, pulls new episode metadata from RSS, and either downloads audio into `podcasts/<slug>/` (archived shows) or records only the enclosure URL for live streaming (non-archived shows).
+- **update_playlists** (cron, hourly at :30) picks one unplayed episode per show from the database, writes an annotated URI line, and records it as played.
 
 ## Directory layout
 
 | Path | Purpose | Tracked in git? |
 |------|---------|-----------------|
-| `music/` | Background music library (scanned recursively) | No |
-| `podcasts/` | Downloaded episodes, one subfolder per show slug | No |
-| `jingles/` | Jingle audio | No |
-| `announcements/` | Announcement audio | No |
-| `playlists/` | Generated `.pls` files, one per show | No |
-| `state/` | SQLite databases (`subscriptions.db`, `played.db`) | No |
-| `logs/` | Rotated logs for each component | No |
+| `<storage>/music/` | Background music library (scanned recursively) | No |
+| `<storage>/podcasts/` | Downloaded episodes, one subfolder per show slug (archived shows only) | No |
+| `<storage>/jingles/` | Jingle audio | No |
+| `<storage>/announcements/` | Announcement audio | No |
+| `<storage>/playlists/` | Generated `.txt` queue files, one per show | No |
+| `<storage>/state/` | SQLite databases (`subscriptions.db`, `played.db`) | No |
+| `<storage>/logs/` | Rotated logs for each component | No |
 | `config.json` | Credentials and connection settings | No (secret) |
 | `schedule.txt` | Human-edited cron schedule of shows/streams | Yes |
 | `station.liq` | liquidsoap configuration | Yes |
 
+Everything that grows over time lives under a single **storage path** chosen at install time and recorded in `config.json`. The code itself stays in the install directory.
+
 ## Configuration: `config.json`
 
-Generated by the installer, edited by hand afterward. Contains two sections:
+Generated by the installer, edited by hand afterward. Contains three sections:
 
 ```json
 {
+  "storage": "/mnt/storage/radio",
   "icecast": {
     "host": "localhost",
     "port": 7777,
@@ -180,7 +76,7 @@ Generated by the installer, edited by hand afterward. Contains two sections:
 }
 ```
 
-The `icecast` block holds the source credentials liquidsoap uses to push the stream (the *source* password from your `icecast.xml`, not the admin password). The `gpodder` block enables optional automatic subscription syncing from gpodder.net; when `enable` is `false`, the fetcher works purely from locally registered shows or imported OPML.
+The `storage` block is the base path for all media, state, and log directories. The `icecast` block holds the source credentials liquidsoap uses to push the stream (the *source* password from your `icecast.xml`, not the admin password). The `gpodder` block enables optional automatic subscription syncing from gpodder.net; when `enable` is `false`, the fetcher works purely from locally registered shows or imported OPML.
 
 Keep this file out of version control — it holds passwords. A `config.example.json` with placeholders can be committed instead if desired.
 
@@ -195,7 +91,7 @@ min hour dom mon dow TYPE TARGET [RUNLENGTH_SECONDS]
 - The first five fields are a standard cron expression.
 - `TYPE` is either `show` or `stream`.
 - `TARGET` is a show slug (for `show`) or a URL (for `stream`).
-- `RUNLENGTH_SECONDS` is required for `stream` entries (how long to play before returning to music) and ignored for `show` entries.
+- `RUNLENGTH_SECONDS` is required for `stream` entries (how long to play before returning to music) and ignored for `show` entries, whose duration comes from the selected episode's stored runlength.
 
 Example:
 
@@ -212,31 +108,31 @@ Lines beginning with `#` and blank lines are skipped. Malformed lines are logged
 
 # Installation
 
-There are two installers. Each is idempotent — safe to re-run after changes. Both must be run as root and must be executed from within the target directory (e.g. `/srv/audio/`); the service name is derived from that directory's basename.
+There are two installers. Each is idempotent — safe to re-run after changes. Both must be run as root and derive the service name from the basename of their containing directory.
 
 ## Choosing a stack
 
-Pick based on what you want to maintain. The Python stack uses a virtualenv and CPython libraries; the Ruby stack provisions its own JDK + JRuby under `/opt` and integrates it system-wide via `update-alternatives`. Functionally they are equivalent.
+Pick based on what you want to maintain. The Python stack uses CPython libraries (`feedparser`, `requests`); the Ruby stack uses JRuby with the `jdbc-sqlite3` gem for database access. Functionally they are equivalent.
 
 ## `install_for_python`
 
-Provisions a Python venv, installs the Python dependencies (feedparser, requests, mutagen, sqlite3), creates the directory tree, generates `config.json`, writes the systemd unit, and sets up the cron jobs. Run it with:
+Creates the storage directory tree, generates `config.json`, writes the systemd unit, and sets up the cron jobs. Run it with:
 
 ```bash
 sudo ./install_for_python
 ```
 
-It walks through interactive prompts for the Icecast host/port/mount/source username/password and the gPodder sync settings, pre-filled from any existing `config.json` so re-runs preserve current values. It confirms a summary before making changes and exits cleanly if you decline.
+It walks through interactive prompts for the storage path, the Icecast host/port/mount/source username/password, and the gPodder sync settings, pre-filled from any existing `config.json` so re-runs preserve current values. It confirms a summary before making changes and exits cleanly if you decline.
 
 ## `install_for_jruby`
 
 The JRuby equivalent, with additional provisioning logic:
 
 1. Installs base packages (liquidsoap, icecast2, jq, curl, unzip).
-2. **Detects Java.** If a JVM ≥ 21 is already present it is reused; otherwise OpenJDK 21 headless is installed.
-3. **Detects JRuby.** Checks the pinned home first, then anything resolvable on `PATH`. Only if neither exists does it download JRuby 10.1.1.0 from Maven Central into `/opt`.
-4. **Integrates via `update-alternatives`**, registering `/usr/local/bin/jruby` (plus `bundle`, `gem`, `rake`, `irb`) so the interpreter resolves consistently for cron, systemd, and shells alike.
-5. **Installs gems one at a time** (bundler, nokogiri, sqlite3, json) with a raised JVM heap (`JRUBY_OPTS=-J-Xmx1g -J-Xss512k`) to avoid out-of-memory failures during multi-gem resolution on low-RAM hosts.
+2. Detects Java; if a suitable JVM is already present it is reused, otherwise OpenJDK headless is installed.
+3. Detects JRuby; only if none exists does it download a pinned release into `/opt`.
+4. Integrates via `update-alternatives`, registering `/usr/local/bin/jruby` (plus `gem`, `bundle`, etc.) so the interpreter resolves consistently for cron, systemd, and shells alike.
+5. **Installs gems one at a time** (`jdbc-sqlite3`, then `json`) with a raised JVM heap to avoid out-of-memory failures during multi-gem resolution on low-RAM hosts. Note: the native `sqlite3` gem is *not* used — it requires a C extension that won't build on JRuby. `jdbc-sqlite3` ships the SQLite JDBC driver as a JAR instead.
 6. Creates directories, generates `config.json`, writes the systemd unit, and sets up cron — same as the Python installer.
 
 Run it with:
@@ -252,7 +148,7 @@ If you later swap JRuby versions, `update-alternatives --config jruby` switches 
 Neither installer takes command-line flags; configuration is collected interactively. Behavior is driven by:
 
 - **Existing `config.json`** — provides defaults for all prompts.
-- **Target directory** — determines `INSTALL_DIR` and the resulting service name.
+- **Target directory** — determines the resulting service name.
 - **System state** — for the JRuby installer, existing Java/JRuby installations are detected and reused rather than overwritten.
 
 After either installer completes, follow the printed next steps: drop music into `music/`, edit `schedule.txt`, review `station.liq`, then start the services.
@@ -269,10 +165,9 @@ Common prefix (adjust per stack):
 
 ```bash
 # Python
-sudo -u liquidsoap <venv>/bin/python /path/fetch_podcasts.py [options]
+python3 fetch_podcasts.py [options]
 # Ruby
-sudo -u liquidsoap env GEM_HOME=/path/.gems GEM_PATH=/path/.gems \
-  /usr/local/bin/jruby -S bundle exec /path/fetch_podcasts.rb [options]
+jruby fetch_podcasts.rb [options]
 ```
 
 ### Options
@@ -280,51 +175,71 @@ sudo -u liquidsoap env GEM_HOME=/path/.gems GEM_PATH=/path/.gems \
 | Option | Argument | Effect |
 |--------|----------|--------|
 | *(none)* | — | Default mode. If gpodder sync is enabled, syncs subscriptions first, then fetches new episodes for all registered shows. |
-| `--list-shows` | — | Prints a table of registered shows (name, slug, protected flag). |
+| `--list-shows` | — | Prints a table of registered shows (slug, archived flag, source, name). |
 | `--detail` | — | With `--list-shows`, additionally prints each show's feed URL. |
-| `--add-show` | `<feed-url>` | Fetches a single feed, registers it, and immediately downloads its episodes. |
-| `--delete-show` | `<slug>` | Removes a show from the registry, deletes its downloaded files, and removes its playlist. |
+| `--add-show` | `<feed-url>` | Fetches a single feed, registers it, and immediately processes its episodes. |
+| `--delete-show` | `<slug>` | Removes a show from the registry, deletes its downloaded files, and removes its queue file. |
+| `--archive` | `<slug>` | Marks a show as archived — subsequent fetches download episodes to disk. |
+| `--unarchive` | `<slug>` | Marks a show as non-archived — subsequent fetches store only the enclosure URL for live streaming. |
 | `--import-opml` | `<file.opml>` | Imports show records from an OPML file (e.g. exported from gpodder). Imported shows are marked protected so they aren't pruned by gpodder sync. |
 
 ### Show registration and protection
 
 Shows enter the registry three ways: manual `--add-show`, `--import-opml`, or gpodder.net sync. Shows added via OPML import or manual add carry an `opml_import` protection flag. When gpodder sync runs, it only prunes shows that were *originally* synced from gpodder.net and have since disappeared from the account — protected shows are never auto-deleted, even if absent from the subscription list.
 
+Every show is assigned a stable `guid` on import: taken from the OPML outline's `guid` attribute when present, otherwise a generated UUID v4. Episodes likewise get a `guid` from the RSS item (falling back to a hash of the entry), giving each record a unique key independent of filename.
+
+### Archived vs. live shows
+
+The `archived` integer flag controls how a show's episodes are handled:
+
+- **Archived (`archived = 1`, the default):** each new episode is downloaded into `podcasts/<slug>/` and its local `file_path` is stored. Playback reads from disk.
+- **Non-archived (`archived = 0`):** no download occurs; only the remote `enclosure_url` is stored. Playback streams live from that URL.
+
+Toggle at any time with `--archive` / `--unarchive`. Flipping the flag affects only episodes fetched *after* the change; previously downloaded files remain valid playable content.
+
+Video-only feeds are filtered out at registration: a show is rejected if its latest enclosure has a `video/*` MIME type or a video file extension. Mixed-content feeds are also handled per-episode, skipping any individual entry whose enclosure is video.
+
 ### Playback duration
 
-Episode durations are extracted from the RSS `enclosure length` attribute (RSS) or `media:duration` (Atom) and stored in seconds, so the scheduler knows how long each episode will run.
+Episode durations are extracted from the RSS `media:duration` element (preferred) or estimated from the `enclosure length` byte count, and stored in seconds as `runlength`. This value is carried into the liquidsoap annotation so the scheduler can clamp each show's playback to its slot.
 
 ## `update_playlists` (`.py` / `.rb`)
 
-Regenerates the per-show `.pls` playlist files based on playback history. Runs automatically via cron every hour at :30 (offset from the fetcher so fresh downloads are available).
+Selects the next unplayed episode per show and writes an annotated URI line for `station.liq` to consume. Runs automatically via cron every hour at :30 (offset from the fetcher so fresh episode records are available).
 
 ```bash
 # Python
-sudo -u liquidsoap <venv>/bin/python /path/update_playlists.py [options]
+python3 update_playlists.py [options]
 # Ruby
-sudo -u liquidsoap env GEM_HOME=/path/.gems GEM_PATH=/path/.gems \
-  /usr/local/bin/jruby -S bundle exec /path/update_playlists.rb [options]
+jruby update_playlists.rb [options]
 ```
 
 ### Options
 
 | Option | Argument | Effect |
 |--------|----------|--------|
-| *(none)* | — | For each show, selects an unplayed episode, writes `playlists/<slug>.pls`, and records it as played. |
-| `--json` | — | Emits a JSON summary of each show's total file count and played count, then exits. Useful for monitoring. |
+| *(none)* | — | For each show, selects an unplayed episode, writes `playlists/<slug>.txt`, and records it as played. |
+| `--json` | — | Emits a JSON summary of each show's total episode count, played count, and unplayed count, then exits. Useful for monitoring. |
 
 ### Selection logic
 
-For each show, the updater scans `podcasts/<slug>/` recursively for audio files, consults `state/played.db` to find which have already aired, and queues one unplayed episode. If everything has been played, it falls back to the least-recently-played episode so the stream never goes silent. The chosen file path is written to the show's `.pls`, and the selection is recorded so the next cycle advances to a different episode.
+For each show, the updater queries `state/played.db` for the earliest episode with `played = 0`, ordered by insertion. This works identically for archived shows (local `file_path`) and live shows (remote `enclosure_url`), because both store their episodes in the table. The selected episode is written as a single annotated URI line:
+
+```
+annotate:liq_runlength="<seconds>",liq_title="<title>":<uri>
+```
+
+where `<uri>` is the local file path for archived episodes or the enclosure URL for live ones. The episode is then marked `played = 1` with a timestamp, so the next cycle advances to a different episode and a restarted liquidsoap won't replay one already committed to the queue.
 
 ## `station.liq`
 
 The liquidsoap program itself. Not invoked directly — it runs under the systemd service. Key behaviors:
 
-- Resolves all paths relative to its own location via `configure.bindir()`, so the whole tree can be relocated without editing the file.
-- Loads Icecast credentials from `config.json` using an annotated `json.parse` binding.
+- Resolves all paths relative to its own location, so the whole tree can be relocated without editing the file.
+- Loads Icecast credentials and the storage path from `config.json`.
 - Maintains a continuous random background-music playlist drawn from `music/`.
-- Uses a request queue as the primary source: when a scheduled show or stream is triggered, it plays ahead of the music fallback; when the queue drains, background music resumes.
+- Uses a `request.dynamic` source with a callback that reads the pre-selected `<slug>.txt` queue file when a scheduled show is due, applies the runlength clamp via a watcher thread, and falls through to background music when the show's slot expires.
 
 To reload after editing, restart the service:
 
@@ -344,7 +259,7 @@ where `<servicename>` is the basename of your install directory.
 sudo systemctl start icecast2
 sudo systemctl start <servicename>
 sudo systemctl status <servicename>
-tail -f /path/logs/liquidsoap.log
+tail -f <storage>/logs/liquidsoap.log
 ```
 
 Enable both at boot:
@@ -365,6 +280,10 @@ sudo systemctl enable icecast2 <servicename>
 # Import a gpodder OPML export
 ... fetch_podcasts --import-opml ~/gpodder-subscriptions.opml
 
+# Switch a show between archived and live
+... fetch_podcasts --archive some_show_slug
+... fetch_podcasts --unarchive some_show_slug
+
 # Remove a show and all its data
 ... fetch_podcasts --delete-show some_show_slug
 ```
@@ -376,11 +295,11 @@ sudo systemctl enable icecast2 <servicename>
 Check the cron logs for fetch/update activity:
 
 ```bash
-tail -f /path/logs/fetch.log
-tail -f /path/logs/update.log
+tail -f <storage>/logs/fetch.log
+tail -f <storage>/logs/update.log
 ```
 
-Query playlist state as JSON:
+Query episode state as JSON:
 
 ```bash
 ... update_playlists --json
@@ -389,3 +308,4 @@ Query playlist state as JSON:
 ## Re-running an installer
 
 Safe at any time. Existing `config.json` supplies prompt defaults, existing Java/JRuby (Ruby stack) or venv (Python stack) are detected and reused, and cron entries are deduplicated so re-runs don't create duplicates.
+
