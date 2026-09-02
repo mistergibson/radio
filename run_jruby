@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Launcher: sets GEM_HOME/GEM_PATH BEFORE jruby starts, so RubyGems picks
+# them up natively at boot (in-process mutation is unreliable per JRuby #5269).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export GEM_HOME="${GEM_HOME:-$SCRIPT_DIR/.gems}"
+export GEM_PATH="${GEM_PATH:-$SCRIPT_DIR/.gems:/opt/jruby/lib/ruby/gems/shared}"
+exec /opt/jruby/bin/jruby "$@"
