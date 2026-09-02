@@ -11,6 +11,18 @@
 # Politeness: audio/video verdict cached in shows.media_class; gpodder OPML
 # pull uses bounded retry with exponential backoff + jitter.
 
+# ---------------------------------------------------------------------------
+# Gem path bootstrap: pin GEM_HOME/GEM_PATH before any require so the script
+# finds its gems regardless of how it was launched (sudo strips them by
+# default via env_reset). Derived from this file's own location so the
+# scripts are relocatable. Guards prevent overriding an explicit environment.
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
+GEMS_DIR   = File.join(SCRIPT_DIR, ".gems")
+ENV["GEM_HOME"] = GEMS_DIR unless ENV["GEM_HOME"]
+ENV["GEM_PATH"] = GEMS_DIR unless ENV["GEM_PATH"]
+Gem.paths = { "GEM_HOME" => ENV["GEM_HOME"], "GEM_PATH" => ENV["GEM_PATH"] }
+
 require "sequel"
 require "net/http"
 require "openssl"
@@ -23,7 +35,7 @@ require "base64"
 require "securerandom"
 require "rexml/document"
 
-ROOT = File.expand_path(File.dirname(__FILE__))
+ROOT = SCRIPT_DIR
 CONFIG_PATH = File.join(ROOT, "config.json")
 
 AUDIO_EXTS = [".mp3", ".m4a"].freeze
@@ -97,31 +109,43 @@ def release_lock!
 end
 
 # ---------------------------------------------------------------------------
-# Schema: single source of truth, applied idempotently via Sequel.
+# Schema: single source of truth, applied idempotently via raw SQL through
+# Database#execute. Raw DDL avoids the Sequel create_table/alter_table DSL,
+# which is unreliable under JRuby (instance_exec'd generator methods can
+# resolve to nil). Works identically on CRuby and JDBC.
 # ---------------------------------------------------------------------------
-SHOWS_COLUMNS = {
-  slug:        { type: :string, primary_key: true },
-  guid:        { type: :string, null: false, unique: true },
-  name:        { type: :string, null: false },
-  feed_url:    { type: :string, null: false, unique: true },
-  source:      { type: :string, default: "manual" },
-  opml_import: { type: :integer, default: 0 },
-  archived:    { type: :integer, default: 1 },
-  media_class: { type: :string },
-  created_at:  { type: :string }
-}.freeze
+SHOWS_SQL = <<~SQL.freeze
+  CREATE TABLE IF NOT EXISTS shows (
+    slug        TEXT PRIMARY KEY,
+    guid        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    feed_url    TEXT NOT NULL UNIQUE,
+    source      TEXT DEFAULT 'manual',
+    opml_import INTEGER DEFAULT 0,
+    archived    INTEGER DEFAULT 1,
+    media_class TEXT,
+    created_at  TEXT
+  );
+SQL
 
-EPISODES_COLUMNS = {
-  id:            { type: :integer, primary_key: true, auto_increment: true },
-  show_slug:     { type: :string, null: false },
-  guid:          { type: :string, null: false },
-  title:         { type: :string },
-  file_path:     { type: :string },
-  enclosure_url: { type: :string },
-  runlength:     { type: :integer },
-  played:        { type: :integer, default: 0 },
-  played_at:     { type: :string }
-}.freeze
+EPISODES_SQL = <<~SQL.freeze
+  CREATE TABLE IF NOT EXISTS episodes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    show_slug     TEXT NOT NULL,
+    guid          TEXT NOT NULL,
+    title         TEXT,
+    file_path     TEXT,
+    enclosure_url TEXT,
+    runlength     INTEGER,
+    played        INTEGER DEFAULT 0,
+    played_at     TEXT,
+    UNIQUE (show_slug, guid)
+  );
+SQL
+
+INDEX_EPISODES_SQL = <<~SQL.freeze
+  CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played);
+SQL
 
 def tune(db)
   # Plain-SQL pragmas via Database#execute, which works on CRuby and JRuby/JDBC
@@ -134,35 +158,16 @@ end
 def connect_subs
   db = Sequel.connect("jdbc:sqlite:#{$subs_db_path}")
   tune(db)
-  ensure_schema!(db, :shows, SHOWS_COLUMNS)
+  db.execute(SHOWS_SQL)
   db
 end
 
 def connect_played
   db = Sequel.connect("jdbc:sqlite:#{$played_db_path}")
   tune(db)
-  ensure_schema!(db, :episodes, EPISODES_COLUMNS)
-  unless db.index_exists?(:episodes, [:show_slug, :played])
-    db.create_index :episodes, [:show_slug, :played], name: :idx_episodes_show_played
-  end
+  db.execute(EPISODES_SQL)
+  db.execute(INDEX_EPISODES_SQL)
   db
-end
-
-def ensure_schema!(db, table, columns)
-  unless db.table_exists?(table)
-    db.create_table(table) do |t|
-      columns.each do |col, opts|
-        t.column(col, **opts)
-      end
-      t.unique_constraint %i[show_slug guid] if table == :episodes
-    end
-    return
-  end
-  existing = db.columns(table)
-  columns.each do |col, opts|
-    next if existing.include?(col)
-    db.alter_table(table) { |t| t.add_column(col, **opts) }
-  end
 end
 
 # ---------------------------------------------------------------------------
@@ -187,8 +192,8 @@ def classify_feed(entries)
   return "audio" if mime.start_with?("audio/")
   return "video" if mime.start_with?("video/")
   url = (enclosures.first[:href] || "").downcase
-  AUDIO_EXTS.any? { |ext| url.end_with?(ext) } && return "audio"
-  VIDEO_EXTS.any? { |ext| url.end_with?(ext) } && return "video"
+  return "audio" if AUDIO_EXTS.any? { |ext| url.end_with?(ext) }
+  return "video" if VIDEO_EXTS.any? { |ext| url.end_with?(ext) }
   "unknown"
 end
 
