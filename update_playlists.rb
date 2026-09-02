@@ -11,12 +11,15 @@
 # Gem path bootstrap: pin GEM_HOME/GEM_PATH before any require so the script
 # finds its gems regardless of how it was launched (sudo strips them by
 # default via env_reset). Derived from this file's own location so the
-# scripts are relocatable. Guards prevent overriding an explicit environment.
+# scripts are relocatable. We PREPEND our .gems dir to the existing GEM_PATH
+# rather than replacing it, so JRuby's shared/stdlib path stays reachable.
+# Guards prevent overriding an explicit environment.
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
 GEMS_DIR   = File.join(SCRIPT_DIR, ".gems")
 ENV["GEM_HOME"] = GEMS_DIR unless ENV["GEM_HOME"]
-ENV["GEM_PATH"] = GEMS_DIR unless ENV["GEM_PATH"]
+_existing_gem_path = ENV["GEM_PATH"].to_s.split(":").reject(&:empty?)
+ENV["GEM_PATH"] = ([GEMS_DIR] + _existing_gem_path).uniq.join(":")
 Gem.paths = { "GEM_HOME" => ENV["GEM_HOME"], "GEM_PATH" => ENV["GEM_PATH"] }
 
 require "sequel"
