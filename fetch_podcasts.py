@@ -27,6 +27,8 @@ from urllib.parse import quote
 
 import feedparser
 import requests
+import requests.packages.urllib3.util.connection as _urllib3_conn
+_urllib3_conn.HAS_IPV6 = False
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
