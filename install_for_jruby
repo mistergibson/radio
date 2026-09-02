@@ -92,7 +92,8 @@ for tool in jruby gem bundle rake irb; do
 done
 
 # ---------------------------------------------------------------------------
-# 5. Gems (one at a time, raised heap)
+# 5. Gems (one at a time, raised heap). Order matters: jdbc-sqlite3 first so
+#    it's present when sequel loads its JDBC SQLite subadapter.
 # ---------------------------------------------------------------------------
 export GEM_HOME="$GEMS_DIR"
 export GEM_PATH="$GEMS_DIR"
@@ -100,6 +101,7 @@ export JRUBY_OPTS="-J-Xmx1g -J-Xss512k"
 
 echo "==> Installing gems one at a time into ${GEMS_DIR} ..."
 "$JRUBY_BIN" -S gem install --no-document jdbc-sqlite3
+"$JRUBY_BIN" -S gem install --no-document sequel
 "$JRUBY_BIN" -S gem install --no-document json
 
 # Give the service user ownership of the gem cache so cron runs work.
@@ -205,49 +207,61 @@ chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$CONFIG_JSON"
 
 # ---------------------------------------------------------------------------
 # 9. Initialize BOTH SQLite databases with the full current schema.
-#    Uses the jdbc-sqlite3 gem (SQLite JDBC driver), matching how the Ruby
-#    scripts access the DB at runtime. Idempotent via IF NOT EXISTS.
+#    Uses Sequel over jdbc-sqlite3, matching how the Ruby scripts access the
+#    DB at runtime. Idempotent via IF NOT EXISTS semantics.
 # ---------------------------------------------------------------------------
-echo "==> Initializing SQLite databases via jdbc-sqlite3 ..."
-GEM_HOME="$GEMS_DIR" GEM_PATH="$GEMS_DIR" "$JRUBY_BIN" -e "
-require 'jdbc/sqlite3'
-require 'java'
+echo "==> Initializing SQLite databases via Sequel/jdbc-sqlite3 ..."
+GEM_HOME="$GEMS_DIR" GEM_PATH="$GEMS_DIR" "$JRUBY_BIN" -e '
+require "sequel"
+
 state_dir = ARGV[0]
-JDBC::Database.new(\"jdbc:sqlite:\#{state_dir}/subscriptions.db\") do |db|
-  db.execute(%Q{
-    CREATE TABLE IF NOT EXISTS shows (
-      slug TEXT PRIMARY KEY,
-      guid TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL,
-      feed_url TEXT NOT NULL UNIQUE,
-      source TEXT DEFAULT 'manual',
-      opml_import INTEGER DEFAULT 0,
-      archived INTEGER DEFAULT 1,
-      created_at TEXT DEFAULT (datetime('now'))
-    )
-  })
+subs_path = File.join(state_dir, "subscriptions.db")
+played_path = File.join(state_dir, "played.db")
+
+db = Sequel.connect("jdbc:sqlite:#{subs_path}")
+db.extension :pragma
+db.pragma journal_mode: :wal
+db.pragma busy_timeout: 5000
+unless db.table_exists?(:shows)
+  db.create_table(:shows) do |t|
+    t.primary_key :slug, type: :string
+    t.string :guid, null: false, unique: true
+    t.string :name, null: false
+    t.string :feed_url, null: false, unique: true
+    t.string :source, default: "manual"
+    t.integer :opml_import, default: 0
+    t.integer :archived, default: 1
+    t.string :media_class
+    t.string :created_at
+  end
 end
-JDBC::Database.new(\"jdbc:sqlite:\#{state_dir}/played.db\") do |db|
-  db.execute(%Q{
-    CREATE TABLE IF NOT EXISTS episodes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      show_slug TEXT NOT NULL,
-      guid TEXT NOT NULL,
-      title TEXT,
-      file_path TEXT,
-      enclosure_url TEXT,
-      runlength INTEGER,
-      played INTEGER DEFAULT 0,
-      played_at TEXT,
-      UNIQUE(show_slug, guid)
-    )
-  })
-  db.execute(%Q{
-    CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played)
-  })
+db.disconnect
+
+db = Sequel.connect("jdbc:sqlite:#{played_path}")
+db.extension :pragma
+db.pragma journal_mode: :wal
+db.pragma busy_timeout: 5000
+unless db.table_exists?(:episodes)
+  db.create_table(:episodes) do |t|
+    t.primary_key :id
+    t.string :show_slug, null: false
+    t.string :guid, null: false
+    t.string :title
+    t.string :file_path
+    t.string :enclosure_url
+    t.integer :runlength
+    t.integer :played, default: 0
+    t.string :played_at
+    t.unique_constraint %i[show_slug guid]
+  end
 end
-puts '    subscriptions.db and played.db initialized.'
-" "$STORAGE_PATH/state"
+unless db.index_exists?(:episodes, [:show_slug, :played])
+  db.create_index(:episodes, [:show_slug, :played], name: :idx_episodes_show_played)
+end
+db.disconnect
+
+puts "    subscriptions.db and played.db initialized."
+' "$STORAGE_PATH/state"
 chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$STORAGE_PATH/state"
 
 # ---------------------------------------------------------------------------

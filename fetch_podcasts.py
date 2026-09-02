@@ -7,16 +7,17 @@ All data (podcasts, state DBs, logs, playlists) lives under the storage path
 defined in config.json ("storage" key), keeping the boot drive clean.
 
 Concurrency model:
-  - An exclusive, non-blocking lockfile (state/fetch.lock) guarantees this
+  - An exclusive, non-blocking lockfile (state/radio.lock) guarantees this
     process and update_playlists.py never touch the databases simultaneously.
     If the updater holds the lock, this run logs a skip and exits 0.
   - Both databases run in WAL mode with a busy timeout as a second safety net.
 
-Filters out video podcasts: only shows whose latest enclosure has an
-audio/* MIME type are registered.
-
-Archived shows (archived=1) have episodes downloaded to disk; non-archived
-shows (archived=0) store only the enclosure URL for live streaming.
+Politeness / efficiency:
+  - The audio-vs-video verdict for each show is cached in subscriptions.db
+    (column media_class). Repeat runs reuse it instead of re-fetching every
+    feed just to re-confirm it is audio.
+  - The gpodder OPML pull uses bounded retry with exponential backoff + jitter
+    so transient failures or a 429 degrade gracefully rather than hammering.
 """
 
 import argparse
@@ -24,18 +25,31 @@ import fcntl
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import socket
 import sqlite3
 import sys
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
 
-# Force IPv4 resolution so we don't stall on AAAA-first lookups when the box
-# has no usable IPv6 route (gpodder.net publishes both A and AAAA records).
+# --- Force IPv4-only resolution ---------------------------------------------
+# Box has no usable IPv6 route; gpodder.net publishes both A and AAAA records,
+# so dual-stack getaddrinfo returns AAAA first and stalls. Constrain every
+# AF_UNSPEC lookup to AF_INET before it reaches the resolver.
+_original_getaddrinfo = socket.getaddrinfo
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family in (0, socket.AF_UNSPEC):
+        family = socket.AF_INET
+    return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 try:
     import requests.packages.urllib3.util.connection as _urllib3_conn
     _urllib3_conn.HAS_IPV6 = False
@@ -64,7 +78,6 @@ def load_config():
         return json.load(f)
 
 def init_paths():
-    """Resolve all data paths from config.json storage key."""
     global STATE_DIR, SUBS_DB, PLAYED_DB, PODCASTS_DIR, LOGS_DIR, PLAYLISTS_DIR, LOCK_FILE
     cfg = load_config()
     storage = Path(cfg["storage"]).expanduser().resolve()
@@ -79,9 +92,7 @@ def init_paths():
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("fetch_podcasts")
 
@@ -89,7 +100,6 @@ def log_error(msg):
     log.error(msg)
 
 def _setup_logging():
-    """Add file handler once LOGS_DIR is known."""
     fh = logging.FileHandler(LOGS_DIR / "fetch.log")
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(fh)
@@ -100,8 +110,6 @@ def _setup_logging():
 _lock_fd = None
 
 def acquire_lock():
-    """Acquire an exclusive non-blocking lock. Returns True if acquired,
-    False if another radio process already holds it."""
     global _lock_fd
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
@@ -110,7 +118,6 @@ def acquire_lock():
     except OSError:
         os.close(fd)
         return False
-    # Record our PID for observability.
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode())
     _lock_fd = fd
@@ -136,6 +143,7 @@ SHOWS_COLUMNS = {
     "source":      "TEXT DEFAULT 'manual'",
     "opml_import": "INTEGER DEFAULT 0",
     "archived":    "INTEGER DEFAULT 1",
+    "media_class": "TEXT",
     "created_at":  "TEXT DEFAULT (datetime('now'))",
 }
 
@@ -159,15 +167,12 @@ def _connect(db_path):
     return conn
 
 def _ensure_columns(conn, table, columns):
-    """Create the table if absent, else add any missing columns."""
     exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone()
     if exists is None:
         defs = ",\n        ".join(f"{name} {spec}" for name, spec in columns.items())
-        extra = ""
-        if table == "episodes":
-            extra = "\n        ,UNIQUE(show_slug, guid)"
+        extra = "\n        ,UNIQUE(show_slug, guid)" if table == "episodes" else ""
         conn.execute(f"CREATE TABLE {table} (\n        {defs}{extra}\n    )")
     else:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -198,27 +203,44 @@ def slugify(name):
 def gen_uuid():
     return str(uuid.uuid4())
 
-def is_audio_feed(parsed):
-    """Check whether the feed's latest episode has an audio enclosure.
-    Returns True if audio, False if video or unknown.
-    """
+def classify_feed(parsed):
+    """Return 'audio', 'video', or 'unknown' based on the latest enclosure."""
     if not parsed.entries:
-        return True  # No entries yet; let it through, will fail on fetch
+        return "unknown"
     entry = parsed.entries[0]
     enclosures = entry.get("enclosures") or []
     if not enclosures:
-        return True  # No enclosure info; assume audio
+        return "unknown"
     mime_type = (enclosures[0].get("type") or "").lower()
     if mime_type.startswith("audio/"):
-        return True
+        return "audio"
     if mime_type.startswith("video/"):
-        return False
+        return "video"
     url = (enclosures[0].get("href") or "").lower()
     if any(url.endswith(ext) for ext in AUDIO_EXTS):
-        return True
+        return "audio"
     if any(url.endswith(ext) for ext in VIDEO_EXTS):
-        return False
-    return True
+        return "video"
+    return "unknown"
+
+def get_media_class(subs_db, slug):
+    row = subs_db.execute("SELECT media_class FROM shows WHERE slug = ?", (slug,)).fetchone()
+    return row["media_class"] if row else None
+
+def set_media_class(subs_db, slug, cls):
+    subs_db.execute("UPDATE shows SET media_class = ? WHERE slug = ?", (cls, slug))
+    subs_db.commit()
+
+def fetch_feed(feed_url):
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as e:
+        log_error(f"Feed parse error for {feed_url}: {e}")
+        return None
+    if parsed.bozo and not parsed.entries:
+        log_error(f"Bozo feed (no entries) for {feed_url}: {parsed.bozo_exception}")
+        return None
+    return parsed
 
 def gpodder_sync(cfg):
     g = cfg["gpodder"]
@@ -230,12 +252,30 @@ def gpodder_sync(cfg):
     print(f"--- Syncing subscriptions from {base} ---")
     print(f"Fetching subscriptions for '{username}'...")
 
-    resp = requests.get(
-        url,
-        auth=(username, password),
-        headers={"User-Agent": "radio-automation/1.0"},
-        timeout=60,
-    )
+    # Bounded retry with exponential backoff + jitter. Retries on network
+    # errors and on 429/5xx; does not retry on 401/404 (auth/not-found).
+    max_attempts = 4
+    backoff_base = 2.0
+    resp = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(
+                url,
+                auth=(username, password),
+                headers={"User-Agent": "radio-automation/1.0"},
+                timeout=60,
+            )
+            break
+        except requests.RequestException as e:
+            if attempt == max_attempts:
+                log_error(f"gPodder sync failed after {attempt} attempts: {e}")
+                return []
+            delay = backoff_base ** attempt + random.uniform(0, 1)
+            log.warning("gPodder request error (%s); retrying in %.1fs", e.__class__.__name__, delay)
+            time.sleep(delay)
+
+    if resp is None:
+        return []
 
     if resp.status_code == 200:
         body = resp.text
@@ -247,8 +287,10 @@ def gpodder_sync(cfg):
         log_error("gPodder sync failed: 401 Unauthorized. Check username/password in config.json.")
     elif resp.status_code == 404:
         log_error("gPodder sync failed: 404 Not Found. User may not exist or has no subscriptions.")
-    elif resp.status_code == 400:
-        log_error("gPodder sync failed: 400 Bad Request.")
+    elif resp.status_code == 429:
+        log_error("gPodder sync throttled (429). Will retry next cycle.")
+    elif resp.status_code >= 500:
+        log_error(f"gPodder sync server error ({resp.status_code}). Will retry next cycle.")
     else:
         log_error(f"gPodder sync failed: unexpected response {resp.status_code}: {resp.text[:200]}")
     return []
@@ -266,11 +308,7 @@ def parse_opml(xml_string):
         guid = (outline.attrib.get("guid") or "").strip()
         if not feed_url or not re.match(r"^https?://", feed_url):
             continue
-        shows.append({
-            "name": name,
-            "feed_url": feed_url,
-            "guid": guid if guid else None,
-        })
+        shows.append({"name": name, "feed_url": feed_url, "guid": guid if guid else None})
     return shows
 
 def register_remote_shows(remote_shows):
@@ -282,20 +320,24 @@ def register_remote_shows(remote_shows):
         existing = db.execute("SELECT slug FROM shows WHERE slug = ?", (slug,)).fetchone()
         if existing is not None:
             continue
+        # Reuse a cached classification if we somehow already know it; otherwise
+        # fetch once to classify. New shows are fetched here regardless.
         parsed = fetch_feed(show["feed_url"])
         if parsed is None:
             log.warning("Skipping '%s': could not fetch feed.", show["name"])
             continue
-        if not is_audio_feed(parsed):
+        cls = classify_feed(parsed)
+        if cls == "video":
             log.info("Skipping '%s' (%s): video podcast, not audio.", show["name"], slug)
             skipped_video += 1
             continue
         guid = show["guid"] or gen_uuid()
         db.execute(
-            "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'gpodder', 0, 1)",
-            (slug, guid, show["name"], show["feed_url"]),
+            "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived, media_class) "
+            "VALUES (?, ?, ?, ?, 'gpodder', 0, 1, ?)",
+            (slug, guid, show["name"], show["feed_url"], cls),
         )
-        log.info("Registered new show: %s (%s)", show["name"], slug)
+        log.info("Registered new show: %s (%s) [%s]", show["name"], slug, cls)
         added += 1
     db.commit()
     db.close()
@@ -343,17 +385,6 @@ def extract_duration(entry):
                 pass
     return None
 
-def fetch_feed(feed_url):
-    try:
-        parsed = feedparser.parse(feed_url)
-    except Exception as e:
-        log_error(f"Feed parse error for {feed_url}: {e}")
-        return None
-    if parsed.bozo and not parsed.entries:
-        log_error(f"Bozo feed (no entries) for {feed_url}: {parsed.bozo_exception}")
-        return None
-    return parsed
-
 def download_episode(url, dest_dir, filename):
     dest = dest_dir / filename
     if dest.exists():
@@ -384,15 +415,33 @@ def show_archived(subs_db, slug):
 def fetch_show_episodes(slug, name, feed_url):
     dest_dir = PODCASTS_DIR / slug
     dest_dir.mkdir(parents=True, exist_ok=True)
+    subs_db = open_subs_db()
+
+    # Respect a cached video classification without re-fetching.
+    cached_cls = get_media_class(subs_db, slug)
+    if cached_cls == "video":
+        subs_db.close()
+        return 0
+
     parsed = fetch_feed(feed_url)
     if parsed is None:
+        subs_db.close()
         return 0
+
+    # Classify and cache if we don't already have a verdict.
+    if cached_cls is None:
+        cls = classify_feed(parsed)
+        set_media_class(subs_db, slug, cls)
+        if cls == "video":
+            log.info("'%s' (%s) classified as video; skipping.", name, slug)
+            subs_db.close()
+            return 0
+
     played_db = open_played_db()
     seen = {
         row["guid"]
         for row in played_db.execute("SELECT guid FROM episodes WHERE show_slug = ?", (slug,))
     }
-    subs_db = open_subs_db()
     archived = show_archived(subs_db, slug)
     new_count = 0
     for entry in parsed.entries:
@@ -452,16 +501,17 @@ def fetch_all_episodes():
 def list_shows(detail=False):
     db = open_subs_db()
     rows = db.execute(
-        "SELECT slug, name, feed_url, source, opml_import, archived FROM shows ORDER BY name"
+        "SELECT slug, name, feed_url, source, opml_import, archived, media_class FROM shows ORDER BY name"
     ).fetchall()
     db.close()
     if not rows:
         print("No shows registered.")
         return
-    print(f"{'SLUG':<30} {'ARCHIVED':<10} {'SOURCE':<10} NAME")
+    print(f"{'SLUG':<30} {'ARCHIVED':<10} {'MEDIA':<8} {'SOURCE':<10} NAME")
     for r in rows:
         arch = "yes" if r["archived"] == 1 else "no"
-        line = f"{r['slug']:<30} {arch:<10} {r['source']:<10} {r['name']}"
+        media = r["media_class"] or "?"
+        line = f"{r['slug']:<30} {arch:<10} {media:<8} {r['source']:<10} {r['name']}"
         if detail:
             line += f"\n{'':<50} {r['feed_url']}"
         print(line)
@@ -471,7 +521,8 @@ def add_show(feed_url):
     if parsed is None or not parsed.feed.get("title"):
         log_error(f"Could not determine show title from {feed_url}")
         return
-    if not is_audio_feed(parsed):
+    cls = classify_feed(parsed)
+    if cls == "video":
         log_error(f"Refusing to add '{parsed.feed['title']}': video podcast detected.")
         return
     name = parsed.feed["title"]
@@ -479,12 +530,13 @@ def add_show(feed_url):
     guid = gen_uuid()
     db = open_subs_db()
     db.execute(
-        "INSERT OR IGNORE INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'manual', 0, 1)",
-        (slug, guid, name, feed_url),
+        "INSERT OR IGNORE INTO shows (slug, guid, name, feed_url, source, opml_import, archived, media_class) "
+        "VALUES (?, ?, ?, ?, 'manual', 0, 1, ?)",
+        (slug, guid, name, feed_url, cls),
     )
     db.commit()
     db.close()
-    log.info("Added show: %s (%s)", name, slug)
+    log.info("Added show: %s (%s) [%s]", name, slug, cls)
     fetch_show_episodes(slug, name, feed_url)
 
 def set_archive(slug, value):
@@ -545,14 +597,16 @@ def import_opml(path):
         if parsed is None:
             log.warning("OPML import: skipping '%s', could not fetch feed.", show["name"])
             continue
-        if not is_audio_feed(parsed):
+        cls = classify_feed(parsed)
+        if cls == "video":
             log.info("OPML import: skipping '%s' (%s): video podcast.", show["name"], slug)
             skipped_video += 1
             continue
         guid = show["guid"] or gen_uuid()
         db.execute(
-            "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived) VALUES (?, ?, ?, ?, 'opml', 1, 1)",
-            (slug, guid, show["name"], show["feed_url"]),
+            "INSERT INTO shows (slug, guid, name, feed_url, source, opml_import, archived, media_class) "
+            "VALUES (?, ?, ?, ?, 'opml', 1, 1, ?)",
+            (slug, guid, show["name"], show["feed_url"], cls),
         )
         added += 1
     db.commit()
@@ -591,7 +645,6 @@ def main():
 
     config = load_config()
 
-    # Read-only administrative commands don't need the write lock.
     needs_lock = not args.list_shows
 
     if needs_lock and not acquire_lock():
@@ -619,4 +672,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

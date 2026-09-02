@@ -3,11 +3,9 @@
 update_playlists.py - Select the next unplayed episode per show and write an
 annotated URI queue file for station.liq to consume.
 
-Concurrency model mirrors fetch_podcasts.py:
-  - Shares the same exclusive lockfile (state/radio.lock). If the fetcher is
-    still running, this run logs a skip and exits 0 instead of hitting a
-    locked database.
-  - Databases run in WAL mode with a busy timeout as a second safety net.
+Concurrency model mirrors fetch_podcasts.py: shares the same exclusive
+lockfile (state/radio.lock); skips cleanly if the fetcher holds it. Databases
+run in WAL mode with a busy timeout as a second safety net.
 
 Selection: for each show, pick the earliest episode with played=0, write
 playlists/<slug>.txt as a single annotated URI line, then mark it played.
@@ -22,7 +20,6 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -55,9 +52,7 @@ def init_paths():
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("update_playlists")
 
@@ -69,9 +64,7 @@ def _setup_logging():
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(fh)
 
-# ---------------------------------------------------------------------------
 # Shared schema definitions (must match fetch_podcasts.py).
-# ---------------------------------------------------------------------------
 SHOWS_COLUMNS = {
     "slug":        "TEXT PRIMARY KEY",
     "guid":        "TEXT NOT NULL UNIQUE",
@@ -80,6 +73,7 @@ SHOWS_COLUMNS = {
     "source":      "TEXT DEFAULT 'manual'",
     "opml_import": "INTEGER DEFAULT 0",
     "archived":    "INTEGER DEFAULT 1",
+    "media_class": "TEXT",
     "created_at":  "TEXT DEFAULT (datetime('now'))",
 }
 
@@ -108,9 +102,7 @@ def _ensure_columns(conn, table, columns):
     ).fetchone()
     if exists is None:
         defs = ",\n        ".join(f"{name} {spec}" for name, spec in columns.items())
-        extra = ""
-        if table == "episodes":
-            extra = "\n        ,UNIQUE(show_slug, guid)"
+        extra = "\n        ,UNIQUE(show_slug, guid)" if table == "episodes" else ""
         conn.execute(f"CREATE TABLE {table} (\n        {defs}{extra}\n    )")
     else:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -134,9 +126,6 @@ def open_played_db():
     conn.commit()
     return conn
 
-# ---------------------------------------------------------------------------
-# Mutual exclusion (shared with fetch_podcasts.py via the same lockfile).
-# ---------------------------------------------------------------------------
 _lock_fd = None
 
 def acquire_lock():
@@ -162,39 +151,28 @@ def release_lock():
         finally:
             _lock_fd = None
 
-# ---------------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------------
 def _annotate_uri(runlength, title, uri):
-    """Build a liquidsoap annotated URI line. Values must be double-quoted
-    and separated by commas; the whole annotation precedes a colon before
-    the URI. Escapes embedded double quotes minimally."""
     def q(v):
         return '"' + str(v).replace('"', '\\"') + '"'
     ann = f"annotate:liq_runlength={q(runlength)},liq_title={q(title)}:"
     return ann + uri
 
 def select_next_episode(slug, played_db):
-    row = played_db.execute(
+    return played_db.execute(
         "SELECT guid, title, file_path, enclosure_url, runlength "
         "FROM episodes WHERE show_slug=? AND played=0 ORDER BY id ASC LIMIT 1",
         (slug,),
     ).fetchone()
-    return row
 
 def mark_as_played(slug, guid, played_db):
     played_db.execute(
-        "UPDATE episodes SET played=1, played_at=datetime('now') "
-        "WHERE show_slug=? AND guid=?",
+        "UPDATE episodes SET played=1, played_at=datetime('now') WHERE show_slug=? AND guid=?",
         (slug, guid),
     )
     played_db.commit()
 
 def write_queue_file(slug, ep, archived):
-    if archived:
-        uri = ep["file_path"]
-    else:
-        uri = ep["enclosure_url"]
+    uri = ep["file_path"] if archived else ep["enclosure_url"]
     if not uri:
         return None
     line = _annotate_uri(ep["runlength"], ep["title"], uri)
@@ -254,7 +232,6 @@ def main():
     PLAYLISTS_DIR.mkdir(parents=True, exist_ok=True)
     _setup_logging()
 
-    # --json is read-only and doesn't need the write lock.
     needs_lock = not args.json
 
     if needs_lock and not acquire_lock():

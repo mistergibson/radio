@@ -1,6 +1,5 @@
 # Secrets and local configuration
 config.json
-dirs.txt
 # Runtime data (should live under the storage path, not here)
 .venv/
 state/
