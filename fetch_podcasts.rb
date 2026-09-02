@@ -11,15 +11,19 @@
 # Politeness: audio/video verdict cached in shows.media_class; gpodder OPML
 # pull uses bounded retry with exponential backoff + jitter.
 
-require 'sequel'
-require 'net/http'
-require 'openssl'
-require 'json'
-require 'logger'
-require 'digest/md5'
-require 'time'
+require "sequel"
+require "net/http"
+require "openssl"
+require "json"
+require "logger"
+require "time"
+require "fileutils"
+require "cgi"
+require "base64"
+require "securerandom"
+require "rexml/document"
 
-ROOT = File.expand_path(File.dirname(__file__))
+ROOT = File.expand_path(File.dirname(__FILE__))
 CONFIG_PATH = File.join(ROOT, "config.json")
 
 AUDIO_EXTS = [".mp3", ".m4a"].freeze
@@ -57,8 +61,6 @@ def log_error(msg)
 end
 
 def setup_logging!
-  fh = Logger.new(File.join($logs_dir, "fetch.log"))
-  fh.formatter = $log.formatter
   $log.instance_variable_set(:@logdev,
     Logger::LogDevice.new([STDOUT, File.join($logs_dir, "fetch.log")]))
 end
@@ -106,7 +108,7 @@ SHOWS_COLUMNS = {
   opml_import: { type: :integer, default: 0 },
   archived:    { type: :integer, default: 1 },
   media_class: { type: :string },
-  created_at:  { type: :string, default: Sequel.function(:datetime, "'now'") }
+  created_at:  { type: :string }
 }.freeze
 
 EPISODES_COLUMNS = {
@@ -121,20 +123,24 @@ EPISODES_COLUMNS = {
   played_at:     { type: :string }
 }.freeze
 
+def tune(db)
+  # Plain-SQL pragmas via Database#execute, which works on CRuby and JRuby/JDBC
+  # across all modern Sequel versions (the :pragma extension is CRuby-only and
+  # db.sql requires Sequel >= 5.42).
+  db.execute("PRAGMA journal_mode=WAL;")
+  db.execute("PRAGMA busy_timeout=5000;")
+end
+
 def connect_subs
   db = Sequel.connect("jdbc:sqlite:#{$subs_db_path}")
-  db.extension :pragma
-  db.pragma journal_mode: :wal
-  db.pragma busy_timeout: 5000
+  tune(db)
   ensure_schema!(db, :shows, SHOWS_COLUMNS)
   db
 end
 
 def connect_played
   db = Sequel.connect("jdbc:sqlite:#{$played_db_path}")
-  db.extension :pragma
-  db.pragma journal_mode: :wal
-  db.pragma busy_timeout: 5000
+  tune(db)
   ensure_schema!(db, :episodes, EPISODES_COLUMNS)
   unless db.index_exists?(:episodes, [:show_slug, :played])
     db.create_index :episodes, [:show_slug, :played], name: :idx_episodes_show_played
@@ -169,7 +175,6 @@ def slugify(name)
 end
 
 def gen_uuid
-  require "securerandom"
   SecureRandom.uuid
 end
 
@@ -197,10 +202,8 @@ def set_media_class(db, slug, cls)
 end
 
 # ---------------------------------------------------------------------------
-# Feed parsing (uses open-uri / rss-lite approach via Net::HTTP + REXML)
+# Feed parsing (Net::HTTP + REXML)
 # ---------------------------------------------------------------------------
-require "rexml/document"
-
 def fetch_feed(feed_url)
   uri = URI.parse(feed_url)
   http = Net::HTTP.new(uri.host, uri.port)
@@ -216,29 +219,27 @@ def fetch_feed(feed_url)
   title = channel.elements["title"]&.text
   entries = []
   channel.get_elements("./item").each do |item|
-    link_el = item.elements["link"]
+    link_el  = item.elements["link"]
     title_el = item.elements["title"]
-    guid_el = item.elements["guid"]
-    dur_el = item.elements["media:duration"] || item.elements["itunes:duration"]
-    enc_el = item.elements["enclosure"]
-    iso_dur_el = item.elements["itunes:duration"]
+    guid_el  = item.elements["guid"]
+    dur_el   = item.elements["media:duration"] || item.elements["itunes:duration"]
+    enc_el   = item.elements["enclosure"]
 
     enclosures = []
     if enc_el
       enclosures << {
-        href: enc_el.attributes["url"],
-        type: enc_el.attributes["type"],
+        href:   enc_el.attributes["url"],
+        type:   enc_el.attributes["type"],
         length: enc_el.attributes["length"]
       }
     end
 
     entries << {
-      link: link_el&.text,
-      title: title_el&.text,
-      guid: guid_el&.text,
+      link:   link_el&.text,
+      title:  title_el&.text,
+      guid:   guid_el&.text,
       enclosures: enclosures,
-      duration: dur_el&.text,
-      iso_duration: iso_dur_el&.text
+      duration: dur_el&.text
     }
   end
 
@@ -386,21 +387,11 @@ def extract_duration(entry)
   dur = entry[:duration]
   if dur
     return dur.to_i if dur.match?(/\A\d+\z/)
-    m = dur.match(/\APT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?\z/)
+    m = dur.match(/\APT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?\z/i)
     if m
-      h = m[1] ? m[1].to_i : 0
+      h  = m[1] ? m[1].to_i : 0
       mn = m[2] ? m[2].to_i : 0
-      s = m[3] ? m[3].to_i : 0
-      return h * 3600 + mn * 60 + s
-    end
-  end
-  iso = entry[:iso_duration]
-  if iso
-    m = iso.match(/\APT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?\z/)
-    if m
-      h = m[1] ? m[1].to_i : 0
-      mn = m[2] ? m[2].to_i : 0
-      s = m[3] ? m[3].to_i : 0
+      s  = m[3] ? m[3].to_i : 0
       return h * 3600 + mn * 60 + s
     end
   end
@@ -500,17 +491,9 @@ def fetch_show_episodes(slug, name, feed_url)
       filename = safe_filename(title, guid[-20..])
       file_path = download_episode(audio_url, dest_dir, filename)
       next if file_path.nil?
-      played_db[:episodes].insert_or_ignore(
-        show_slug: slug, guid: guid, title: title,
-        file_path: file_path, enclosure_url: audio_url,
-        runlength: duration, played: 0
-      )
+      insert_episode(played_db, slug, guid, title, file_path, audio_url, duration)
     else
-      played_db[:episodes].insert_or_ignore(
-        show_slug: slug, guid: guid, title: title,
-        file_path: nil, enclosure_url: audio_url,
-        runlength: duration, played: 0
-      )
+      insert_episode(played_db, slug, guid, title, nil, audio_url, duration)
     end
     new_count += 1
     kind = archived ? "downloaded" : "live"
@@ -520,6 +503,19 @@ def fetch_show_episodes(slug, name, feed_url)
   played_db.disconnect
   subs_db.disconnect
   new_count
+end
+
+def insert_episode(db, slug, guid, title, file_path, enclosure_url, duration)
+  # INSERT OR IGNORE semantics via the UNIQUE(show_slug, guid) constraint.
+  db.transaction do
+    db[:episodes].insert(
+      show_slug: slug, guid: guid, title: title,
+      file_path: file_path, enclosure_url: enclosure_url,
+      runlength: duration, played: 0
+    )
+  end
+rescue Sequel::UniqueConstraintViolation
+  # Already recorded; ignore.
 end
 
 def fetch_all_episodes
@@ -575,10 +571,14 @@ def add_show(feed_url)
   slug = slugify(name)
   guid = gen_uuid
   db = connect_subs
-  db[:shows].insert_or_ignore(
-    slug: slug, guid: guid, name: name, feed_url: feed_url,
-    source: "manual", opml_import: 0, archived: 1, media_class: cls
-  )
+  begin
+    db[:shows].insert(
+      slug: slug, guid: guid, name: name, feed_url: feed_url,
+      source: "manual", opml_import: 0, archived: 1, media_class: cls
+    )
+  rescue Sequel::UniqueConstraintViolation
+    # already present
+  end
   db.disconnect
   $log.info("Added show: #{name} (#{slug}) [#{cls}]")
   fetch_show_episodes(slug, name, feed_url)
@@ -668,10 +668,6 @@ def run_fetch(config)
   fetch_all_episodes
 end
 
-require "fileutils"
-require "cgi"
-require "base64"
-
 def main
   args = ARGV.dup
   option = args.shift
@@ -698,15 +694,14 @@ def main
   when "--import-opml"
     import_opml(args.first)
   else
-    needs_lock = true
-    if needs_lock && !acquire_lock!
+    if !acquire_lock!
       $log.info("Another radio process holds the lock; skipping this run.")
       return
     end
     begin
       run_fetch(config)
     ensure
-      release_lock! if needs_lock
+      release_lock!
     end
   end
 end

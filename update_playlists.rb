@@ -12,7 +12,7 @@ require "json"
 require "logger"
 require "time"
 
-ROOT = File.expand_path(File.dirname(__file__))
+ROOT = File.expand_path(File.dirname(__FILE__))
 CONFIG_PATH = File.join(ROOT, "config.json")
 
 $state_dir = nil
@@ -40,7 +40,7 @@ def init_paths!
 end
 
 $log = Logger.new(STDOUT)
-$log.formatter = proc { |msg, _sev, _time, _prog| "#{Time.now} [INFO] #{msg}\n" }
+$log.formatter = proc { |msg, _severity, _time, _progname| "#{Time.now} [INFO] #{msg}\n" }
 
 def log_error(msg)
   $log.error(msg)
@@ -51,6 +51,9 @@ def setup_logging!
     Logger::LogDevice.new([STDOUT, File.join($logs_dir, "update.log")]))
 end
 
+# ---------------------------------------------------------------------------
+# Schema: single source of truth, applied idempotently via Sequel.
+# ---------------------------------------------------------------------------
 SHOWS_COLUMNS = {
   slug:        { type: :string, primary_key: true },
   guid:        { type: :string, null: false, unique: true },
@@ -60,7 +63,7 @@ SHOWS_COLUMNS = {
   opml_import: { type: :integer, default: 0 },
   archived:    { type: :integer, default: 1 },
   media_class: { type: :string },
-  created_at:  { type: :string, default: Sequel.function(:datetime, "'now'") }
+  created_at:  { type: :string }
 }.freeze
 
 EPISODES_COLUMNS = {
@@ -75,20 +78,24 @@ EPISODES_COLUMNS = {
   played_at:     { type: :string }
 }.freeze
 
+def tune(db)
+  # Plain-SQL pragmas via Database#execute, which works on CRuby and JRuby/JDBC
+  # across all modern Sequel versions (the :pragma extension is CRuby-only and
+  # db.sql requires Sequel >= 5.42).
+  db.execute("PRAGMA journal_mode=WAL;")
+  db.execute("PRAGMA busy_timeout=5000;")
+end
+
 def connect_subs
   db = Sequel.connect("jdbc:sqlite:#{$subs_db_path}")
-  db.extension :pragma
-  db.pragma journal_mode: :wal
-  db.pragma busy_timeout: 5000
+  tune(db)
   ensure_schema!(db, :shows, SHOWS_COLUMNS)
   db
 end
 
 def connect_played
   db = Sequel.connect("jdbc:sqlite:#{$played_db_path}")
-  db.extension :pragma
-  db.pragma journal_mode: :wal
-  db.pragma busy_timeout: 5000
+  tune(db)
   ensure_schema!(db, :episodes, EPISODES_COLUMNS)
   unless db.index_exists?(:episodes, [:show_slug, :played])
     db.create_index :episodes, [:show_slug, :played], name: :idx_episodes_show_played
@@ -99,7 +106,9 @@ end
 def ensure_schema!(db, table, columns)
   unless db.table_exists?(table)
     db.create_table(table) do |t|
-      columns.each { |col, opts| t.column(col, **opts) }
+      columns.each do |col, opts|
+        t.column(col, **opts)
+      end
       t.unique_constraint %i[show_slug guid] if table == :episodes
     end
     return
@@ -111,6 +120,9 @@ def ensure_schema!(db, table, columns)
   end
 end
 
+# ---------------------------------------------------------------------------
+# Mutual exclusion via flock on a shared lockfile.
+# ---------------------------------------------------------------------------
 $lock_fh = nil
 
 def acquire_lock!
@@ -139,6 +151,9 @@ def release_lock!
   end
 end
 
+# ---------------------------------------------------------------------------
+# Queue-file generation
+# ---------------------------------------------------------------------------
 def annotate_uri(runlength, title, uri)
   def esc(v)
     '"' + v.to_s.gsub('"', '\\"') + '"'
@@ -157,7 +172,7 @@ end
 def mark_as_played(slug, guid, played_db)
   played_db[:episodes]
     .where(show_slug: slug, guid: guid)
-    .update(played: 1, played_at: Sequel.function(:datetime, "'now'"))
+    .update(played: 1, played_at: Time.now.utc.strftime("%Y-%m-%d %H:%M:%S"))
 end
 
 def write_queue_file(slug, ep, archived)
@@ -200,8 +215,7 @@ def json_summary
   result = {}
   shows.each do |show|
     slug = show[:slug]
-    counts = played_db[:episodes].where(show_slug: slug).hash_and_count
-    total = counts.values.sum
+    total = played_db[:episodes].where(show_slug: slug).count
     unplayed = played_db[:episodes].where(show_slug: slug, played: 0).count
     result[slug] = {
       name: show[:name],
@@ -241,4 +255,3 @@ def main
 end
 
 main if __FILE__ == $PROGRAM_NAME
-

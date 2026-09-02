@@ -104,7 +104,6 @@ echo "==> Installing gems one at a time into ${GEMS_DIR} ..."
 "$JRUBY_BIN" -S gem install --no-document sequel
 "$JRUBY_BIN" -S gem install --no-document json
 
-# Give the service user ownership of the gem cache so cron runs work.
 chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$GEMS_DIR"
 
 # ---------------------------------------------------------------------------
@@ -207,57 +206,65 @@ chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$CONFIG_JSON"
 
 # ---------------------------------------------------------------------------
 # 9. Initialize BOTH SQLite databases with the full current schema.
-#    Uses Sequel over jdbc-sqlite3, matching how the Ruby scripts access the
-#    DB at runtime. Idempotent via IF NOT EXISTS semantics.
+#    Uses raw CREATE TABLE IF NOT EXISTS via Database#execute - avoids the
+#    Sequel create_table DSL, which is unreliable under JRuby (instance_exec'd
+#    generator methods can resolve to nil). Works on CRuby and JDBC alike.
 # ---------------------------------------------------------------------------
 echo "==> Initializing SQLite databases via Sequel/jdbc-sqlite3 ..."
 GEM_HOME="$GEMS_DIR" GEM_PATH="$GEMS_DIR" "$JRUBY_BIN" -e '
 require "sequel"
 
-state_dir = ARGV[0]
-subs_path = File.join(state_dir, "subscriptions.db")
+state_dir   = ARGV[0]
+subs_path   = File.join(state_dir, "subscriptions.db")
 played_path = File.join(state_dir, "played.db")
 
-db = Sequel.connect("jdbc:sqlite:#{subs_path}")
-db.extension :pragma
-db.pragma journal_mode: :wal
-db.pragma busy_timeout: 5000
-unless db.table_exists?(:shows)
-  db.create_table(:shows) do |t|
-    t.primary_key :slug, type: :string
-    t.string :guid, null: false, unique: true
-    t.string :name, null: false
-    t.string :feed_url, null: false, unique: true
-    t.string :source, default: "manual"
-    t.integer :opml_import, default: 0
-    t.integer :archived, default: 1
-    t.string :media_class
-    t.string :created_at
-  end
+def tune(db)
+  db.execute("PRAGMA journal_mode=WAL;")
+  db.execute("PRAGMA busy_timeout=5000;")
 end
+
+SHOWS_SQL = <<~SQL
+  CREATE TABLE IF NOT EXISTS shows (
+    slug        TEXT PRIMARY KEY,
+    guid        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    feed_url    TEXT NOT NULL UNIQUE,
+    source      TEXT DEFAULT '"'"'manual'"'"',
+    opml_import INTEGER DEFAULT 0,
+    archived    INTEGER DEFAULT 1,
+    media_class TEXT,
+    created_at  TEXT
+  );
+SQL
+
+EPISODES_SQL = <<~SQL
+  CREATE TABLE IF NOT EXISTS episodes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    show_slug     TEXT NOT NULL,
+    guid          TEXT NOT NULL,
+    title         TEXT,
+    file_path     TEXT,
+    enclosure_url TEXT,
+    runlength     INTEGER,
+    played        INTEGER DEFAULT 0,
+    played_at     TEXT,
+    UNIQUE (show_slug, guid)
+  );
+SQL
+
+INDEX_SQL = <<~SQL
+  CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played);
+SQL
+
+db = Sequel.connect("jdbc:sqlite:#{subs_path}")
+tune(db)
+db.execute(SHOWS_SQL)
 db.disconnect
 
 db = Sequel.connect("jdbc:sqlite:#{played_path}")
-db.extension :pragma
-db.pragma journal_mode: :wal
-db.pragma busy_timeout: 5000
-unless db.table_exists?(:episodes)
-  db.create_table(:episodes) do |t|
-    t.primary_key :id
-    t.string :show_slug, null: false
-    t.string :guid, null: false
-    t.string :title
-    t.string :file_path
-    t.string :enclosure_url
-    t.integer :runlength
-    t.integer :played, default: 0
-    t.string :played_at
-    t.unique_constraint %i[show_slug guid]
-  end
-end
-unless db.index_exists?(:episodes, [:show_slug, :played])
-  db.create_index(:episodes, [:show_slug, :played], name: :idx_episodes_show_played)
-end
+tune(db)
+db.execute(EPISODES_SQL)
+db.execute(INDEX_SQL)
 db.disconnect
 
 puts "    subscriptions.db and played.db initialized."
@@ -296,13 +303,12 @@ exec("liquidsoap", File.expand_path("station.liq"))
 RBRUN
 chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "${INSTALL_DIR}/station.rb"
 
-# Allow the service user to traverse the install dir.
 chmod o+x "$INSTALL_DIR"
 
 systemctl daemon-reload
 
 # ---------------------------------------------------------------------------
-# 11. Cron jobs — installed into the liquidsoap user's crontab so all
+# 11. Cron jobs - installed into the liquidsoap user's crontab so all
 #     database/media writes happen under the same identity as the service.
 # ---------------------------------------------------------------------------
 echo "==> Setting up cron jobs under user '${LIQUIDSOAP_USER}' ..."
@@ -311,14 +317,12 @@ UPDATE_PREFIX="cd ${INSTALL_DIR} && GEM_HOME=${GEMS_DIR} GEM_PATH=${GEMS_DIR} ${
 FETCH_CRON="0 * * * * ${FETCH_PREFIX} >> ${STORAGE_PATH}/logs/fetch.log 2>&1"
 UPDATE_CRON="30 * * * * ${UPDATE_PREFIX} >> ${STORAGE_PATH}/logs/update.log 2>&1"
 
-# Remove any stale entries from the liquidsoap user's crontab, then add ours.
 sudo -u "$LIQUIDSOAP_USER" crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_ls_rb.$$ || true
 echo "$FETCH_CRON"  >> /tmp/cron_ls_rb.$$
 echo "$UPDATE_CRON" >> /tmp/cron_ls_rb.$$
 sudo -u "$LIQUIDSOAP_USER" crontab /tmp/cron_ls_rb.$$
 rm -f /tmp/cron_ls_rb.$$
 
-# Also scrub these from root's crontab in case an earlier install put them there.
 crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_root_rb.$$ || true
 crontab /tmp/cron_root_rb.$$
 rm -f /tmp/cron_root_rb.$$
