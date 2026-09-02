@@ -6,6 +6,12 @@ for the liquidsoap radio automation stack.
 All data (podcasts, state DBs, logs, playlists) lives under the storage path
 defined in config.json ("storage" key), keeping the boot drive clean.
 
+Concurrency model:
+  - An exclusive, non-blocking lockfile (state/fetch.lock) guarantees this
+    process and update_playlists.py never touch the databases simultaneously.
+    If the updater holds the lock, this run logs a skip and exits 0.
+  - Both databases run in WAL mode with a busy timeout as a second safety net.
+
 Filters out video podcasts: only shows whose latest enclosure has an
 audio/* MIME type are registered.
 
@@ -14,10 +20,13 @@ shows (archived=0) store only the enclosure URL for live streaming.
 """
 
 import argparse
+import fcntl
 import json
 import logging
+import os
 import re
 import shutil
+import socket
 import sqlite3
 import sys
 import uuid
@@ -25,10 +34,16 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
 
+# Force IPv4 resolution so we don't stall on AAAA-first lookups when the box
+# has no usable IPv6 route (gpodder.net publishes both A and AAAA records).
+try:
+    import requests.packages.urllib3.util.connection as _urllib3_conn
+    _urllib3_conn.HAS_IPV6 = False
+except Exception:
+    pass
+
 import feedparser
 import requests
-import requests.packages.urllib3.util.connection as _urllib3_conn
-_urllib3_conn.HAS_IPV6 = False
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -42,6 +57,7 @@ PLAYED_DB = None
 PODCASTS_DIR = None
 LOGS_DIR = None
 PLAYLISTS_DIR = None
+LOCK_FILE = None
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -49,7 +65,7 @@ def load_config():
 
 def init_paths():
     """Resolve all data paths from config.json storage key."""
-    global STATE_DIR, SUBS_DB, PLAYED_DB, PODCASTS_DIR, LOGS_DIR, PLAYLISTS_DIR
+    global STATE_DIR, SUBS_DB, PLAYED_DB, PODCASTS_DIR, LOGS_DIR, PLAYLISTS_DIR, LOCK_FILE
     cfg = load_config()
     storage = Path(cfg["storage"]).expanduser().resolve()
     STATE_DIR = storage / "state"
@@ -58,6 +74,7 @@ def init_paths():
     PODCASTS_DIR = storage / "podcasts"
     LOGS_DIR = storage / "logs"
     PLAYLISTS_DIR = storage / "playlists"
+    LOCK_FILE = STATE_DIR / "radio.lock"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,41 +94,100 @@ def _setup_logging():
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(fh)
 
-def open_subs_db():
-    conn = sqlite3.connect(SUBS_DB)
+# ---------------------------------------------------------------------------
+# Mutual exclusion: one writer across fetch + update at any moment.
+# ---------------------------------------------------------------------------
+_lock_fd = None
+
+def acquire_lock():
+    """Acquire an exclusive non-blocking lock. Returns True if acquired,
+    False if another radio process already holds it."""
+    global _lock_fd
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    # Record our PID for observability.
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    _lock_fd = fd
+    return True
+
+def release_lock():
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        finally:
+            _lock_fd = None
+
+# ---------------------------------------------------------------------------
+# Schema: single source of truth per database, applied idempotently.
+# ---------------------------------------------------------------------------
+SHOWS_COLUMNS = {
+    "slug":        "TEXT PRIMARY KEY",
+    "guid":        "TEXT NOT NULL UNIQUE",
+    "name":        "TEXT NOT NULL",
+    "feed_url":    "TEXT NOT NULL UNIQUE",
+    "source":      "TEXT DEFAULT 'manual'",
+    "opml_import": "INTEGER DEFAULT 0",
+    "archived":    "INTEGER DEFAULT 1",
+    "created_at":  "TEXT DEFAULT (datetime('now'))",
+}
+
+EPISODES_COLUMNS = {
+    "id":            "INTEGER PRIMARY KEY AUTOINCREMENT",
+    "show_slug":     "TEXT NOT NULL",
+    "guid":          "TEXT NOT NULL",
+    "title":         "TEXT",
+    "file_path":     "TEXT",
+    "enclosure_url": "TEXT",
+    "runlength":     "INTEGER",
+    "played":        "INTEGER DEFAULT 0",
+    "played_at":     "TEXT",
+}
+
+def _connect(db_path):
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS shows (
-            slug TEXT PRIMARY KEY,
-            guid TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL,
-            feed_url TEXT NOT NULL UNIQUE,
-            source TEXT DEFAULT 'manual',
-            opml_import INTEGER DEFAULT 0,
-            archived INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+def _ensure_columns(conn, table, columns):
+    """Create the table if absent, else add any missing columns."""
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if exists is None:
+        defs = ",\n        ".join(f"{name} {spec}" for name, spec in columns.items())
+        extra = ""
+        if table == "episodes":
+            extra = "\n        ,UNIQUE(show_slug, guid)"
+        conn.execute(f"CREATE TABLE {table} (\n        {defs}{extra}\n    )")
+    else:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, spec in columns.items():
+            if name not in existing:
+                col_default = spec.split("DEFAULT", 1)[1].strip() if "DEFAULT" in spec else "NULL"
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_default}")
     conn.commit()
+
+def open_subs_db():
+    conn = _connect(SUBS_DB)
+    _ensure_columns(conn, "shows", SHOWS_COLUMNS)
     return conn
 
 def open_played_db():
-    conn = sqlite3.connect(PLAYED_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS episodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            show_slug TEXT NOT NULL,
-            guid TEXT NOT NULL,
-            title TEXT,
-            file_path TEXT,
-            enclosure_url TEXT,
-            runlength INTEGER,
-            played INTEGER DEFAULT 0,
-            played_at TEXT,
-            UNIQUE(show_slug, guid)
-        )
-    """)
+    conn = _connect(PLAYED_DB)
+    _ensure_columns(conn, "episodes", EPISODES_COLUMNS)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played)"
+    )
     conn.commit()
     return conn
 
@@ -416,6 +492,7 @@ def set_archive(slug, value):
     row = db.execute("SELECT name FROM shows WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         log_error(f"No show found with slug '{slug}'.")
+        db.close()
         return
     db.execute("UPDATE shows SET archived = ? WHERE slug = ?", (value, slug))
     db.commit()
@@ -436,6 +513,7 @@ def delete_show(slug):
     row = db.execute("SELECT name FROM shows WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         log_error(f"No show found with slug '{slug}'.")
+        db.close()
         return
     remove_show_data(slug)
     db.execute("DELETE FROM shows WHERE slug = ?", (slug,))
@@ -513,20 +591,32 @@ def main():
 
     config = load_config()
 
-    if args.archive:
-        set_archive(args.archive, 1)
-    elif args.unarchive:
-        set_archive(args.unarchive, 0)
-    elif args.list_shows:
-        list_shows(detail=args.detail)
-    elif args.add_show:
-        add_show(args.add_show)
-    elif args.delete_show:
-        delete_show(args.delete_show)
-    elif args.import_opml:
-        import_opml(args.import_opml)
-    else:
-        run_fetch(config)
+    # Read-only administrative commands don't need the write lock.
+    needs_lock = not args.list_shows
+
+    if needs_lock and not acquire_lock():
+        log.info("Another radio process holds the lock; skipping this run.")
+        return
+
+    try:
+        if args.archive:
+            set_archive(args.archive, 1)
+        elif args.unarchive:
+            set_archive(args.unarchive, 0)
+        elif args.list_shows:
+            list_shows(detail=args.detail)
+        elif args.add_show:
+            add_show(args.add_show)
+        elif args.delete_show:
+            delete_show(args.delete_show)
+        elif args.import_opml:
+            import_opml(args.import_opml)
+        else:
+            run_fetch(config)
+    finally:
+        if needs_lock:
+            release_lock()
 
 if __name__ == "__main__":
     main()
+

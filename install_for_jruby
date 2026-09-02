@@ -102,6 +102,9 @@ echo "==> Installing gems one at a time into ${GEMS_DIR} ..."
 "$JRUBY_BIN" -S gem install --no-document jdbc-sqlite3
 "$JRUBY_BIN" -S gem install --no-document json
 
+# Give the service user ownership of the gem cache so cron runs work.
+chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$GEMS_DIR"
+
 # ---------------------------------------------------------------------------
 # 6. Interactive configuration (defaults from existing config.json)
 # ---------------------------------------------------------------------------
@@ -279,22 +282,32 @@ exec("liquidsoap", File.expand_path("station.liq"))
 RBRUN
 chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "${INSTALL_DIR}/station.rb"
 
+# Allow the service user to traverse the install dir.
+chmod o+x "$INSTALL_DIR"
+
 systemctl daemon-reload
 
 # ---------------------------------------------------------------------------
-# 11. Cron jobs (deduplicated)
+# 11. Cron jobs — installed into the liquidsoap user's crontab so all
+#     database/media writes happen under the same identity as the service.
 # ---------------------------------------------------------------------------
-echo "==> Setting up cron jobs ..."
+echo "==> Setting up cron jobs under user '${LIQUIDSOAP_USER}' ..."
 FETCH_PREFIX="cd ${INSTALL_DIR} && GEM_HOME=${GEMS_DIR} GEM_PATH=${GEMS_DIR} ${JRUBY_BIN} -S fetch_podcasts.rb"
 UPDATE_PREFIX="cd ${INSTALL_DIR} && GEM_HOME=${GEMS_DIR} GEM_PATH=${GEMS_DIR} ${JRUBY_BIN} -S update_playlists.rb"
 FETCH_CRON="0 * * * * ${FETCH_PREFIX} >> ${STORAGE_PATH}/logs/fetch.log 2>&1"
 UPDATE_CRON="30 * * * * ${UPDATE_PREFIX} >> ${STORAGE_PATH}/logs/update.log 2>&1"
 
-crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_radio_rb.$$ || true
-echo "$FETCH_CRON"  >> /tmp/cron_radio_rb.$$
-echo "$UPDATE_CRON" >> /tmp/cron_radio_rb.$$
-crontab /tmp/cron_radio_rb.$$
-rm -f /tmp/cron_radio_rb.$$
+# Remove any stale entries from the liquidsoap user's crontab, then add ours.
+sudo -u "$LIQUIDSOAP_USER" crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_ls_rb.$$ || true
+echo "$FETCH_CRON"  >> /tmp/cron_ls_rb.$$
+echo "$UPDATE_CRON" >> /tmp/cron_ls_rb.$$
+sudo -u "$LIQUIDSOAP_USER" crontab /tmp/cron_ls_rb.$$
+rm -f /tmp/cron_ls_rb.$$
+
+# Also scrub these from root's crontab in case an earlier install put them there.
+crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_root_rb.$$ || true
+crontab /tmp/cron_root_rb.$$
+rm -f /tmp/cron_root_rb.$$
 
 # ---------------------------------------------------------------------------
 # 12. Enable services
