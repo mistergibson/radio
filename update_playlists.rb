@@ -1,265 +1,218 @@
 #!/usr/bin/env jruby
 # frozen_string_literal: true
 #
-# update_playlists.rb - Select the next unplayed episode per show and write an
-# annotated URI queue file for station.liq to consume (JRuby/Sequel variant).
+# update_playlists.rb - Select the next unplayed episode per show and write
+# annotated-URI queue files for station.liq to consume.
 #
-# Shares the same exclusive lockfile as fetch_podcasts.rb; skips cleanly if
-# the fetcher holds it. Databases run in WAL mode with a busy timeout.
+# Reads from played.db (episode records with played flag), writes queue files
+# under <storage>/playlists/. Cycles archived shows when all episodes are
+# already played.
+#
+# Usage:
+#   ./update_playlists.rb [--json]
+#
+# Options:
+#   --json    Emit a JSON summary of each show's episode counts to stdout.
 
-# ---------------------------------------------------------------------------
-# Gem path bootstrap: pin GEM_HOME/GEM_PATH before any require so the script
-# finds its gems regardless of how it was launched (sudo strips them by
-# default via env_reset). Derived from this file's own location so the
-# scripts are relocatable. We PREPEND our .gems dir to the existing GEM_PATH
-# rather than replacing it, so JRuby's shared/stdlib path stays reachable.
-# Guards prevent overriding an explicit environment.
-# ---------------------------------------------------------------------------
-SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
-GEMS_DIR   = File.join(SCRIPT_DIR, ".gems")
-ENV["GEM_HOME"] = GEMS_DIR unless ENV["GEM_HOME"]
-_existing_gem_path = ENV["GEM_PATH"].to_s.split(":").reject(&:empty?)
-ENV["GEM_PATH"] = ([GEMS_DIR] + _existing_gem_path).uniq.join(":")
-Gem.paths = { "GEM_HOME" => ENV["GEM_HOME"], "GEM_PATH" => ENV["GEM_PATH"] }
-
-require "sequel"
 require "json"
-require "logger"
-require "time"
+require "sequel"
 
-ROOT = SCRIPT_DIR
-CONFIG_PATH = File.join(ROOT, "config.json")
-
-$state_dir = nil
-$subs_db_path = nil
-$played_db_path = nil
-$podcasts_dir = nil
-$logs_dir = nil
-$playlists_dir = nil
-$lock_file = nil
+SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
+CONFIG_PATH = File.join(SCRIPT_DIR, "config.json")
 
 def load_config
-  JSON.parse(File.read(CONFIG_PATH))
+  raw = File.read(CONFIG_PATH)
+  cfg = JSON.parse(raw)
+  raise "FATAL: storage missing from config.json" unless cfg["storage"] && !cfg["storage"].to_s.empty?
+  cfg
 end
 
-def init_paths!
-  cfg = load_config
-  storage = File.realpath(cfg["storage"])
-  $state_dir      = File.join(storage, "state")
-  $subs_db_path   = File.join($state_dir, "subscriptions.db")
-  $played_db_path = File.join($state_dir, "played.db")
-  $podcasts_dir   = File.join(storage, "podcasts")
-  $logs_dir       = File.join(storage, "logs")
-  $playlists_dir  = File.join(storage, "playlists")
-  $lock_file      = File.join($state_dir, "radio.lock")
+CFG = load_config
+STORAGE_ROOT = CFG["storage"]
+STATE_DIR    = File.join(STORAGE_ROOT, "state")
+PLAYLISTS_DIR = File.join(STORAGE_ROOT, "playlists")
+LOG_DIR      = File.join(STATE_DIR, "logs")
+LOCK_FILE    = File.join(STATE_DIR, "radio.lock")
+SUBS_DB_PATH = File.join(STATE_DIR, "subscriptions.db")
+EPISODES_DB_PATH = File.join(STATE_DIR, "episodes.db")
+
+[DIRS_TO_CREATE].each do |d|
+  Dir.mkdir(d) unless Dir.exist?(d)
 end
 
-$log = Logger.new(STDOUT)
-$log.formatter = proc { |msg, _severity, _time, _progname| "#{Time.now} [INFO] #{msg}\n" }
-
-def log_error(msg)
-  $log.error(msg)
+$log_fh = File.open(File.join(LOG_DIR, "update_playlists.log"), "a")
+def log(level, msg)
+  ts = Time.now.strftime("%Y-%m-%d %H:%M:%S")
+  line = "[#{ts}] [#{level}] #{msg}"
+  puts(line)
+  $log_fh.write("#{line}\n")
+  $log_fh.flush
 end
 
-def setup_logging!
-  $log.instance_variable_set(:@logdev,
-    Logger::LogDevice.new([STDOUT, File.join($logs_dir, "update.log")]))
+db_subs = Sequel.jdbc("sqlite:", SUBS_DB_PATH)
+db_eps  = Sequel.jdbc("sqlite:", EPISODES_DB_PATH)
+
+db_subs.execute("PRAGMA journal_mode=WAL;")
+db_eps.execute("PRAGMA journal_mode=WAL;")
+db_subs.execute("PRAGMA busy_timeout=5000;")
+db_eps.execute("PRAGMA busy_timeout=5000;")
+
+def table_exists?(db, name)
+  db[:sqlite_master].where(type: "table", name: name).count > 0
 end
 
-# ---------------------------------------------------------------------------
-# Schema: single source of truth, applied idempotently via raw SQL through
-# Database#execute. Raw DDL avoids the Sequel create_table/alter_table DSL,
-# which is unreliable under JRuby (instance_exec'd generator methods can
-# resolve to nil). Works identically on CRuby and JDBC.
-# ---------------------------------------------------------------------------
-SHOWS_SQL = <<~SQL.freeze
-  CREATE TABLE IF NOT EXISTS shows (
-    slug        TEXT PRIMARY KEY,
-    guid        TEXT NOT NULL UNIQUE,
-    name        TEXT NOT NULL,
-    feed_url    TEXT NOT NULL UNIQUE,
-    source      TEXT DEFAULT 'manual',
-    opml_import INTEGER DEFAULT 0,
-    archived    INTEGER DEFAULT 1,
-    media_class TEXT,
-    created_at  TEXT
-  );
-SQL
+def ensure_schema(db, path, label)
+  if !table_exists?(db, "shows")
+    db.execute <<-SQL
+CREATE TABLE IF NOT EXISTS shows (
+  guid TEXT PRIMARY KEY,
+  slug TEXT UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  feed_url TEXT NOT NULL,
+  audio_only INTEGER DEFAULT 1,
+  archive INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+    SQL
+    log("INFO", "Created 'shows' table in #{label}")
+  end
 
-EPISODES_SQL = <<~SQL.freeze
-  CREATE TABLE IF NOT EXISTS episodes (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    show_slug     TEXT NOT NULL,
-    guid          TEXT NOT NULL,
-    title         TEXT,
-    file_path     TEXT,
-    enclosure_url TEXT,
-    runlength     INTEGER,
-    played        INTEGER DEFAULT 0,
-    played_at     TEXT,
-    UNIQUE (show_slug, guid)
-  );
-SQL
-
-INDEX_EPISODES_SQL = <<~SQL.freeze
-  CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played);
-SQL
-
-def tune(db)
-  # Plain-SQL pragmas via Database#execute, which works on CRuby and JRuby/JDBC
-  # across all modern Sequel versions (the :pragma extension is CRuby-only and
-  # db.sql requires Sequel >= 5.42).
-  db.execute("PRAGMA journal_mode=WAL;")
-  db.execute("PRAGMA busy_timeout=5000;")
+  if !table_exists?(db, "episodes")
+    db.execute <<-SQL
+CREATE TABLE IF NOT EXISTS episodes (
+  guid TEXT PRIMARY KEY,
+  show_guid TEXT NOT NULL REFERENCES shows(guid),
+  title TEXT,
+  enclosure_url TEXT,
+  runlength INTEGER DEFAULT 0,
+  played INTEGER DEFAULT 0,
+  downloaded INTEGER DEFAULT 0,
+  local_path TEXT,
+  fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+    SQL
+    log("INFO", "Created 'episodes' table in #{label}")
+  end
 end
 
-def connect_subs
-  db = Sequel.connect("jdbc:sqlite:#{$subs_db_path}")
-  tune(db)
-  db.execute(SHOWS_SQL)
-  db
-end
-
-def connect_played
-  db = Sequel.connect("jdbc:sqlite:#{$played_db_path}")
-  tune(db)
-  db.execute(EPISODES_SQL)
-  db.execute(INDEX_EPISODES_SQL)
-  db
-end
-
-# ---------------------------------------------------------------------------
-# Mutual exclusion via flock on a shared lockfile.
-# ---------------------------------------------------------------------------
-$lock_fh = nil
+ensure_schema(db_subs, SUBS_DB_PATH, "subscriptions.db")
+ensure_schema(db_eps, EPISODES_DB_PATH, "episodes.db")
 
 def acquire_lock!
-  Dir.mkdir($state_dir) unless Dir.exist?($state_dir)
-  fh = File.open($lock_file, File::RDWR | File::CREAT, 0o644)
+  @lock_fh = File.new(LOCK_FILE, "a+")
   begin
-    fh.flock(File::LOCK_EX | File::LOCK_NB)
-  rescue Errno::EACCES, Errno::EAGAIN
-    fh.close
-    return false
+    @lock_fh.flock(File::LOCK_EX | File::LOCK_NB)
+  rescue IOError
+    log("WARN", "Another radio process holds the lock; skipping this run.")
+    exit 0
   end
-  fh.truncate(0)
-  fh.write(Process.pid.to_s)
-  fh.rewind
-  $lock_fh = fh
-  true
 end
 
 def release_lock!
-  return if $lock_fh.nil?
-  begin
-    $lock_fh.flock(File::LOCK_UN)
-    $lock_fh.close
-  ensure
-    $lock_fh = nil
+  @lock_fh.flock(File::LOCK_UN) if @lock_fh
+  @lock_fh.close if @lock_fh
+  @lock_fh = nil
+end
+
+def make_annotated_uri(ep)
+  uri = ep[:local_path] || ep[:enclosure_url]
+  rl  = ep[:runlength].to_i
+  ttl = ep[:title].to_s.gsub('"', '\\"')
+  "annotate:liq_runlength=\"#{rl}\",liq_title=\"#{ttl}\":#{uri}"
+end
+
+def select_next_episode(show_guid)
+  # Try to find an unplayed episode
+  ep = db_eps[:episodes].where(show_guid: show_guid, played: 0).order(:fetched_at.asc).first
+  
+  if ep.nil?
+    # All episodes played — reset all to unplayed, then pick the first
+    count = db_eps[:episodes].where(show_guid: show_guid).count
+    if count > 0
+      db_eps[:episodes].where(show_guid: show_guid).update(played: 0)
+      log("INFO", "Reset all episodes for show #{show_guid} to played=0 (cycling)")
+      ep = db_eps[:episodes].where(show_guid: show_guid).order(:fetched_at.asc).first
+    end
   end
+  
+  ep
 end
 
-# ---------------------------------------------------------------------------
-# Queue-file generation
-# ---------------------------------------------------------------------------
-def annotate_uri(runlength, title, uri)
-  def esc(v)
-    '"' + v.to_s.gsub('"', '\\"') + '"'
+def update_show_queue(show)
+  slug = show[:slug]
+  queue_dir = File.join(PLAYLISTS_DIR, slug)
+  Dir.mkdir(queue_dir) unless Dir.exist?(queue_dir)
+  
+  ep = select_next_episode(show[:guid])
+  
+  if ep.nil?
+    log("WARN", "No episodes available for show '#{slug}'")
+    return false
   end
-  "annotate:liq_runlength=#{esc(runlength)},liq_title=#{esc(title)}:" + uri
-end
-
-def select_next_episode(slug, played_db)
-  played_db[:episodes]
-    .where(show_slug: slug, played: 0)
-    .order(:id.asc)
-    .limit(1)
-    .first
-end
-
-def mark_as_played(slug, guid, played_db)
-  played_db[:episodes]
-    .where(show_slug: slug, guid: guid)
-    .update(played: 1, played_at: Time.now.utc.strftime("%Y-%m-%d %H:%M:%S"))
-end
-
-def write_queue_file(slug, ep, archived)
-  uri = archived ? ep[:file_path] : ep[:enclosure_url]
-  return nil if uri.nil? || uri.empty?
-  line = annotate_uri(ep[:runlength], ep[:title], uri)
-  out = File.join($playlists_dir, "#{slug}.txt")
-  File.write(out, line + "\n")
-  out
+  
+  annotated = make_annotated_uri(ep)
+  queue_file = File.join(queue_dir, "next.uri")
+  File.write(queue_file, "#{annotated}\n")
+  
+  # Mark as played
+  db_eps[:episodes].where(guid: ep[:guid]).update(played: 1)
+  
+  log("INFO", "Queued episode '#{ep[:title]}' for show '#{slug}' (runlength=#{ep[:runlength]}s)")
+  true
 end
 
 def update_all
-  subs_db = connect_subs
-  played_db = connect_played
-  shows = subs_db[:shows].order(:name).all
-  updated = 0
+  shows = db_subs[:shows].all
+  
+  if shows.empty?
+    log("INFO", "No shows registered; nothing to do.")
+    return
+  end
+  
+  queued_count = 0
+  failed_count = 0
+  
   shows.each do |show|
-    slug = show[:slug]
-    archived = show[:archived] == 1
-    ep = select_next_episode(slug, played_db)
-    next if ep.nil?
-    out = write_queue_file(slug, ep, archived)
-    if out.nil?
-      $log.warn("No playable URI for #{show[:name]} (#{slug}); skipping.")
-      next
-    end
-    mark_as_played(slug, ep[:guid], played_db)
-    updated += 1
-    $log.info("Queued #{slug}: #{ep[:title]} -> #{File.basename(out)}")
-  end
-  subs_db.disconnect
-  played_db.disconnect
-  $log.info("=== Update complete: #{updated} show(s) queued ===")
-end
-
-def json_summary
-  subs_db = connect_subs
-  played_db = connect_played
-  shows = subs_db[:shows].order(:name).all
-  result = {}
-  shows.each do |show|
-    slug = show[:slug]
-    total = played_db[:episodes].where(show_slug: slug).count
-    unplayed = played_db[:episodes].where(show_slug: slug, played: 0).count
-    result[slug] = {
-      name: show[:name],
-      total: total,
-      unplayed: unplayed,
-      played: total - unplayed
-    }
-  end
-  subs_db.disconnect
-  played_db.disconnect
-  puts JSON.pretty_generate(result)
-end
-
-def main
-  args = ARGV.dup
-  json_mode = args.delete("--json")
-
-  init_paths!
-  [$state_dir, $logs_dir, $playlists_dir].each do |dir|
-    Dir.mkdir(dir) unless Dir.exist?(dir)
-  end
-  setup_logging!
-
-  if json_mode
-    json_summary
-  else
-    if !acquire_lock!
-      $log.info("Another radio process holds the lock; skipping this run.")
-      return
-    end
     begin
-      update_all
-    ensure
-      release_lock!
+      if update_show_queue(show)
+        queued_count += 1
+      else
+        failed_count += 1
+      end
+    rescue Exception => e
+      failed_count += 1
+      log("ERROR", "Failed to update queue for show '#{show[:slug]}': #{e.class} #{e.message}")
     end
+  end
+  
+  log("INFO", "Update complete: #{queued_count} queued, #{failed_count} failed out of #{shows.size} shows")
+  
+  if ARGV.include?("--json")
+    summary = {}
+    shows.each do |show|
+      total = db_eps[:episodes].where(show_guid: show[:guid]).count
+      played = db_eps[:episodes].where(show_guid: show[:guid], played: 1).count
+      unplayed = total - played
+      summary[show[:slug]] = { total: total, played: played, unplayed: unplayed }
+    end
+    puts(JSON.pretty_generate(summary))
   end
 end
 
-main if __FILE__ == $PROGRAM_NAME
+begin
+  acquire_lock!
+  begin
+    update_all
+  ensure
+    release_lock!
+  end
+rescue Exception => e
+  log("ERROR", "Fatal error: #{e.class} #{e.message}")
+  log("ERROR", e.backtrace.first(10).join("\n"))
+  exit 1
+end
+
+db_subs.disconnect
+db_eps.disconnect
+$log_fh.close
+

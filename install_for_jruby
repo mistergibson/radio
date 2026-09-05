@@ -1,293 +1,151 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# install_for_jruby - Installer for the JRuby radio automation stack.
 #
-# install_for_jruby - Provision the JRuby radio automation stack.
-# Idempotent: safe to re-run. Derives the service name from this file's
-# containing directory basename. Must be run as root.
-#
+# Derives its service name from the directory it lives in, e.g.
+#   /srv/radio/install_for_jruby  ->  radio.service
+# Prompts for a storage root and writes a complete config.json.
+# Creates media subdirectories (music, podcasts, jingles, announcements),
+# state/ and logs/ under the storage root, drops and recreates all
+# database files, installs gems one at a time, generates a systemd unit,
+# and adds cron entries to the existing liquidsoap user's crontab.
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: this installer must be run as root." >&2
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVICE_BASENAME="$(basename "${INSTALL_DIR}")"
+SERVICE_NAME="${SERVICE_BASENAME}.service"
+UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}"
+
+CONFIG_JSON="${INSTALL_DIR}/config.json"
+GEMS_DIR="${INSTALL_DIR}/.gems"
+JRUBY_BIN=""
+
+echo "=== ${SERVICE_BASENAME} installer ==="
+echo
+
+# --- Detect JRuby -----------------------------------------------------------
+if command -v jruby >/dev/null 2>&1; then
+    JRUBY_BIN="$(command -v jruby)"
+elif [ -x /opt/jruby/bin/jruby ]; then
+    JRUBY_BIN="/opt/jruby/bin/jruby"
+else
+    echo "ERROR: jruby not found on PATH or at /opt/jruby/bin/jruby." >&2
     exit 1
 fi
+echo "==> Using JRuby: ${JRUBY_BIN}"
+echo
 
-INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_NAME="$(basename "$INSTALL_DIR")"
-UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-LIQUIDSOAP_USER="liquidsoap"
-JRUBY_HOME_PINNED="/opt/jruby"
-JRUBY_VERSION="10.1.1.0"
-GEMS_DIR="${INSTALL_DIR}/.gems"
+# --- Prompt for storage root ------------------------------------------------
+STORAGE_ROOT_DEFAULT="/mnt/storage/radio"
+printf "Storage root [%s]: " "${STORAGE_ROOT_DEFAULT}"
+read -r STORAGE_ROOT_INPUT
+STORAGE_ROOT="${STORAGE_ROOT_INPUT:-${STORAGE_ROOT_DEFAULT}}"
+echo "==> Storage root: ${STORAGE_ROOT}"
 
-echo "==> Installing ${SERVICE_NAME} (JRuby stack) from ${INSTALL_DIR}"
+# --- Create media and state directories -------------------------------------
+for d in music podcasts jingles announcements state logs; do
+    mkdir -p "${STORAGE_ROOT}/${d}"
+done
+chown -R liquidsoap:liquidsoap "${STORAGE_ROOT}" 2>/dev/null || true
+echo "==> Media/state/log directories created under ${STORAGE_ROOT}"
 
-# ---------------------------------------------------------------------------
-# 1. Base packages
-# ---------------------------------------------------------------------------
-echo "==> Ensuring base packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq \
-    liquidsoap icecast2 jq curl unzip ca-certificates >/dev/null
+# --- Drop and recreate databases --------------------------------------------
+rm -f "${STORAGE_ROOT}/state/subscriptions.db" \
+      "${STORAGE_ROOT}/state/played.db" \
+      "${STORAGE_ROOT}/state/subscriptions.db-wal" \
+      "${STORAGE_ROOT}/state/subscriptions.db-shm" \
+      "${STORAGE_ROOT}/state/played.db-wal" \
+      "${STORAGE_ROOT}/state/played.db-shm"
+echo "==> Databases dropped (will be recreated by scripts on first run)"
 
-if ! id -u "$LIQUIDSOAP_USER" >/dev/null 2>&1; then
-    useradd --system --create-home --shell /usr/sbin/nologin "$LIQUIDSOAP_USER"
-    echo "    created system user '${LIQUIDSOAP_USER}'"
-fi
+# --- Install gems one at a time ---------------------------------------------
+export GEM_HOME="${GEMS_DIR}"
+export GEM_PATH="${GEMS_DIR}"
+mkdir -p "${GEMS_DIR}"
 
-# ---------------------------------------------------------------------------
-# 2. Java detection / install
-# ---------------------------------------------------------------------------
-have_java() {
-    command -v java >/dev/null 2>&1 || return 1
-    local major
-    major=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}' | cut -d. -f1)
-    [[ "$major" == "1" ]] && major=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}' | cut -d. -f2)
-    [[ -n "$major" && "$major" -ge 21 ]]
-}
-
-if have_java; then
-    echo "==> Reusing existing JVM ($(java -version 2>&1 | head -1))."
-else
-    echo "==> No suitable JVM found; installing OpenJDK 21 headless..."
-    apt-get install -y -qq openjdk-21-jdk-headless >/dev/null
-fi
-
-# ---------------------------------------------------------------------------
-# 3. JRuby detection / install
-# ---------------------------------------------------------------------------
-have_jruby() {
-    if [[ -x "${JRUBY_HOME_PINNED}/bin/jruby" ]]; then
-        echo "${JRUBY_HOME_PINNED}/bin/jruby"; return 0
-    fi
-    if command -v jruby >/dev/null 2>&1; then
-        command -v jruby; return 0
-    fi
-    return 1
-}
-
-if JRUBY_BIN=$(have_jruby); then
-    echo "==> Reusing existing JRuby at ${JRUBY_BIN}."
-else
-    echo "==> Downloading JRuby ${JRUBY_VERSION} into ${JRUBY_HOME_PINNED} ..."
-    mkdir -p "$JRUBY_HOME_PINNED"
-    TARBALL="/tmp/jruby-${JRUBY_VERSION}-bin.tar.gz"
-    URL="https://repo1.maven.org/maven2/org/jruby/jruby-dist/${JRUBY_VERSION}/jruby-dist-${JRUBY_VERSION}-bin.tar.gz"
-    curl -fsSL "$URL" -o "$TARBALL"
-    tar -xzf "$TARBALL" -C "$JRUBY_HOME_PINNED" --strip-components=1
-    rm -f "$TARBALL"
-    JRUBY_BIN="${JRUBY_HOME_PINNED}/bin/jruby"
-fi
-
-# ---------------------------------------------------------------------------
-# 4. Register via update-alternatives
-# ---------------------------------------------------------------------------
-echo "==> Integrating JRuby via update-alternatives ..."
-for tool in jruby gem bundle rake irb; do
-    target="${JRUBY_BIN%/*}/${tool}"
-    if [[ -x "$target" ]]; then
-        ln -sf "$target" "/usr/local/bin/${tool}"
-        update-alternatives --install "/usr/local/bin/${tool}" "${tool}" "$target" 100 || true
+for gem_name in sequel jdbc-sqlite3 json nokogiri; do
+    echo "==> Installing gem: ${gem_name}"
+    if ! "${JRUBY_BIN}" -S gem install --local "${gem_name}" 2>/dev/null; then
+        "${JRUBY_BIN}" -S gem install "${gem_name}"
     fi
 done
 
-# ---------------------------------------------------------------------------
-# 5. Gems (one at a time, raised heap). Order matters: jdbc-sqlite3 first so
-#    it's present when sequel loads its JDBC SQLite subadapter.
-# ---------------------------------------------------------------------------
-export GEM_HOME="$GEMS_DIR"
-export GEM_PATH="$GEMS_DIR"
-export JRUBY_OPTS="-J-Xmx1g -J-Xss512k"
+# --- Write complete config.json ----------------------------------------------
+ICECAST_HOST_DEFAULT="192.168.0.200"
+ICECAST_PORT_DEFAULT="7777"
+ICECAST_MOUNT_DEFAULT="/data"
+ICECAST_SOURCE_USER_DEFAULT="source"
+GPODDER_ENABLE_DEFAULT="false"
+GPODDER_HOST_DEFAULT="gpodder.net"
 
-echo "==> Installing gems one at a time into ${GEMS_DIR} ..."
-"$JRUBY_BIN" -S gem install --no-document jdbc-sqlite3
-"$JRUBY_BIN" -S gem install --no-document sequel
-"$JRUBY_BIN" -S gem install --no-document json
-
-chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$GEMS_DIR"
-
-# ---------------------------------------------------------------------------
-# 6. Interactive configuration (defaults from existing config.json)
-# ---------------------------------------------------------------------------
-CONFIG_JSON="${INSTALL_DIR}/config.json"
-
-prompt() {
-    local prompt_text="$1" default="${2:-}"
-    local current=""
-    if [[ -n "$default" ]]; then
-        read -rp "${prompt_text} [${default}]: " current || true
-        echo "${current:-$default}"
-    else
-        read -rp "${prompt_text}: " current || true
-        echo "$current"
+printf "Icecast host [%s]: " "${ICECAST_HOST_DEFAULT}"
+read -r ICECAST_HOST_INPUT; ICECAST_HOST="${ICECAST_HOST_INPUT:-${ICECAST_HOST_DEFAULT}}"
+printf "Icecast source port [%s]: " "${ICECAST_PORT_DEFAULT}"
+read -r ICECAST_PORT_INPUT; ICECAST_PORT="${ICECAST_PORT_INPUT:-${ICECAST_PORT_DEFAULT}}"
+printf "Mount point [%s]: " "${ICECAST_MOUNT_DEFAULT}"
+read -r ICECAST_MOUNT_INPUT; ICECAST_MOUNT="${ICECAST_MOUNT_INPUT:-${ICECAST_MOUNT_DEFAULT}}"
+printf "Source username [%s]: " "${ICECAST_SOURCE_USER_DEFAULT}"
+read -r ICECAST_SRC_USER_INPUT; ICECAST_SRC_USER="${ICECAST_SRC_USER_INPUT:-${ICECAST_SOURCE_USER_DEFAULT}}"
+printf "Source password: "
+read -rs ICECAST_SRC_PASS
+echo
+printf "gPodder sync enabled? (y/n) [n]: "
+read -r GP_SYNC_INPUT
+case "${GP_SYNC_INPUT,,}" in
+    y|yes) GP_ENABLED=true ;;
+    *)     GP_ENABLED=false ;;
+esac
+GP_HOST="${GPODDER_HOST_DEFAULT}"
+GP_USERNAME=""
+GP_PASSWORD=""
+GP_DEVICE_ID=""
+if [ "${GP_ENABLED}" = "true" ]; then
+    printf "gPodder username: "
+    read -r GP_USERNAME
+    printf "gPodder password: "
+    read -rs GP_PASSWORD
+    echo
+    printf "gPodder device ID (leave blank to generate): "
+    read -r GP_DEVICE_ID
+    if [ -z "${GP_DEVICE_ID}" ]; then
+        GP_DEVICE_ID="radio-$(date +%s)-$$"
     fi
-}
-
-existing_storage="" ; existing_ic_host="" ; existing_ic_port=""
-existing_ic_mount="" ; existing_ic_user="" ; existing_ic_pass=""
-existing_gp_enable="" ; existing_gp_host="" ; existing_gp_user="" ; existing_gp_pass=""
-
-if [[ -f "$CONFIG_JSON" ]]; then
-    echo "==> Found existing config.json; using it for defaults."
-    existing_storage=$(jq -r '.storage // empty' "$CONFIG_JSON")
-    existing_ic_host=$(jq -r '.icecast.host // empty' "$CONFIG_JSON")
-    existing_ic_port=$(jq -r '.icecast.port // empty' "$CONFIG_JSON")
-    existing_ic_mount=$(jq -r '.icecast.mount // empty' "$CONFIG_JSON")
-    existing_ic_user=$(jq -r '.icecast.username // empty' "$CONFIG_JSON")
-    existing_ic_pass=$(jq -r '.icecast.password // empty' "$CONFIG_JSON")
-    existing_gp_enable=$(jq -r '.gpodder.enable // empty' "$CONFIG_JSON")
-    existing_gp_host=$(jq -r '.gpodder.host // empty' "$CONFIG_JSON")
-    existing_gp_user=$(jq -r '.gpodder.username // empty' "$CONFIG_JSON")
-    existing_gp_pass=$(jq -r '.gpodder.password // empty' "$CONFIG_JSON")
 fi
 
-echo ""
-echo "--- Storage ---"
-STORAGE_PATH=$(prompt "Storage path (media + state + logs)" "${existing_storage:-/mnt/storage/radio}")
-[[ -z "$STORAGE_PATH" ]] && STORAGE_PATH="${existing_storage:-/mnt/storage/radio}"
-
-echo ""
-echo "--- Icecast (source credentials) ---"
-IC_HOST=$(prompt "Icecast host" "$existing_ic_host");      IC_HOST=${IC_HOST:-localhost}
-IC_PORT=$(prompt "Icecast source port" "$existing_ic_port"); IC_PORT=${IC_PORT:-7777}
-IC_MOUNT=$(prompt "Mount point" "$existing_ic_mount");       IC_MOUNT=${IC_MOUNT:-/data}
-IC_USER=$(prompt "Source username" "$existing_ic_user");     IC_USER=${IC_USER:-source}
-read -rsp "Source password: " IC_PASS || true; echo;     IC_PASS=${IC_PASS:-$existing_ic_pass}
-
-echo ""
-echo "--- gPodder sync (optional) ---"
-GP_ENABLE=$(prompt "Enable gPodder sync? (true/false)" "$existing_gp_enable"); GP_ENABLE=${GP_ENABLE:-false}
-GP_HOST=$(prompt "gPodder host" "$existing_gp_host");       GP_HOST=${GP_HOST:-https://gpodder.net}
-GP_USER=$(prompt "gPodder username" "$existing_gp_user")
-read -rsp "gPodder password: " GP_PASS || true; echo;    GP_PASS=${GP_PASS:-$existing_gp_pass}
-
-echo ""
-echo "Summary:"
-echo "  Storage : $STORAGE_PATH"
-echo "  Icecast : $IC_USER@$IC_HOST:$IC_PORT mount=$IC_MOUNT"
-echo "  gPodder : enabled=$GP_ENABLE ($GP_USER @ $GP_HOST)"
-read -rp "Proceed? [y/N]: " confirm || true
-case "$confirm" in
-    [Yy]*) ;;
-    *) echo "Aborted."; exit 0 ;;
-esac
-
-# ---------------------------------------------------------------------------
-# 7. Directory tree
-# ---------------------------------------------------------------------------
-echo "==> Creating directory tree under $STORAGE_PATH ..."
-mkdir -p "$STORAGE_PATH"/{music,podcasts,jingles,announcements,state,playlists,logs}
-chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$STORAGE_PATH"
-
-# ---------------------------------------------------------------------------
-# 8. Write config.json (mode 600)
-# ---------------------------------------------------------------------------
-echo "==> Writing $CONFIG_JSON ..."
-cat > "$CONFIG_JSON" <<EOF
+cat > "${CONFIG_JSON}" <<EOF
 {
-  "storage": "${STORAGE_PATH}",
+  "storage": "${STORAGE_ROOT}",
   "icecast": {
-    "host": "${IC_HOST}",
-    "port": ${IC_PORT},
-    "mount": "${IC_MOUNT}",
-    "username": "${IC_USER}",
-    "password": "${IC_PASS}"
+    "host": "${ICECAST_HOST}",
+    "port": ${ICECAST_PORT},
+    "mount": "${ICECAST_MOUNT}",
+    "source_username": "${ICECAST_SRC_USER}",
+    "source_password": "${ICECAST_SRC_PASS}"
   },
   "gpodder": {
-    "enable": $( [[ "$GP_ENABLE" =~ ^([Tt][Rr][Uu][Ee]|1)$ ]] && echo true || echo false ),
+    "enable": ${GP_ENABLED},
     "host": "${GP_HOST}",
-    "username": "${GP_USER}",
-    "password": "${GP_PASS}"
+    "username": "${GP_USERNAME}",
+    "password": "${GP_PASSWORD}",
+    "device_id": "${GP_DEVICE_ID}"
   }
 }
 EOF
-chmod 600 "$CONFIG_JSON"
-chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$CONFIG_JSON"
+chmod 600 "${CONFIG_JSON}"
+echo "==> Wrote ${CONFIG_JSON}"
 
-# ---------------------------------------------------------------------------
-# 9. Initialize BOTH SQLite databases with the full current schema.
-#    Uses raw CREATE TABLE IF NOT EXISTS via Database#execute - avoids the
-#    Sequel create_table DSL, which is unreliable under JRuby (instance_exec'd
-#    generator methods can resolve to nil). Works on CRuby and JDBC alike.
-# ---------------------------------------------------------------------------
-echo "==> Initializing SQLite databases via Sequel/jdbc-sqlite3 ..."
-GEM_HOME="$GEMS_DIR" GEM_PATH="$GEMS_DIR" "$JRUBY_BIN" -e '
-require "sequel"
-
-state_dir   = ARGV[0]
-subs_path   = File.join(state_dir, "subscriptions.db")
-played_path = File.join(state_dir, "played.db")
-
-def tune(db)
-  db.execute("PRAGMA journal_mode=WAL;")
-  db.execute("PRAGMA busy_timeout=5000;")
-end
-
-SHOWS_SQL = <<~SQL
-  CREATE TABLE IF NOT EXISTS shows (
-    slug        TEXT PRIMARY KEY,
-    guid        TEXT NOT NULL UNIQUE,
-    name        TEXT NOT NULL,
-    feed_url    TEXT NOT NULL UNIQUE,
-    source      TEXT DEFAULT '"'"'manual'"'"',
-    opml_import INTEGER DEFAULT 0,
-    archived    INTEGER DEFAULT 1,
-    media_class TEXT,
-    created_at  TEXT
-  );
-SQL
-
-EPISODES_SQL = <<~SQL
-  CREATE TABLE IF NOT EXISTS episodes (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    show_slug     TEXT NOT NULL,
-    guid          TEXT NOT NULL,
-    title         TEXT,
-    file_path     TEXT,
-    enclosure_url TEXT,
-    runlength     INTEGER,
-    played        INTEGER DEFAULT 0,
-    played_at     TEXT,
-    UNIQUE (show_slug, guid)
-  );
-SQL
-
-INDEX_SQL = <<~SQL
-  CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played);
-SQL
-
-db = Sequel.connect("jdbc:sqlite:#{subs_path}")
-tune(db)
-db.execute(SHOWS_SQL)
-db.disconnect
-
-db = Sequel.connect("jdbc:sqlite:#{played_path}")
-tune(db)
-db.execute(EPISODES_SQL)
-db.execute(INDEX_SQL)
-db.disconnect
-
-puts "    subscriptions.db and played.db initialized."
-' "$STORAGE_PATH/state"
-chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$STORAGE_PATH/state"
-
-# ---------------------------------------------------------------------------
-# 10. systemd unit (named after the directory)
-# ---------------------------------------------------------------------------
-echo "==> Writing systemd unit ${UNIT_FILE} ..."
-cat > "$UNIT_FILE" <<EOF
+# --- Generate systemd unit ----------------------------------------------------
+cat > "${UNIT_PATH}" <<EOF
 [Unit]
-Description=Radio automation (${SERVICE_NAME}) - liquidsoap
-After=network-online.target icecast2.service
+Description=${SERVICE_BASENAME} (JRuby radio automation)
+After=network-online.target sound.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=${LIQUIDSOAP_USER}
+User=liquidsoap
 WorkingDirectory=${INSTALL_DIR}
 Environment=GEM_HOME=${GEMS_DIR}
 Environment=GEM_PATH=${GEMS_DIR}
-Environment=JRUBY_OPTS=-J-Xmx1g -J-Xss512k
 ExecStart=${JRUBY_BIN} ${INSTALL_DIR}/station.rb
 Restart=on-failure
 RestartSec=5
@@ -295,51 +153,25 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# Minimal Ruby runner that execs liquidsoap on station.liq from the install dir.
-cat > "${INSTALL_DIR}/station.rb" <<'RBRUN'
-Dir.chdir(File.expand_path(__dir__))
-exec("liquidsoap", File.expand_path("station.liq"))
-RBRUN
-chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "${INSTALL_DIR}/station.rb"
-
-chmod o+x "$INSTALL_DIR"
-
 systemctl daemon-reload
+echo "==> Installed ${UNIT_PATH}"
 
-# ---------------------------------------------------------------------------
-# 11. Cron jobs - installed into the liquidsoap user's crontab so all
-#     database/media writes happen under the same identity as the service.
-# ---------------------------------------------------------------------------
-echo "==> Setting up cron jobs under user '${LIQUIDSOAP_USER}' ..."
-FETCH_PREFIX="cd ${INSTALL_DIR} && GEM_HOME=${GEMS_DIR} GEM_PATH=${GEMS_DIR} ${JRUBY_BIN} -S fetch_podcasts.rb"
-UPDATE_PREFIX="cd ${INSTALL_DIR} && GEM_HOME=${GEMS_DIR} GEM_PATH=${GEMS_DIR} ${JRUBY_BIN} -S update_playlists.rb"
-FETCH_CRON="0 * * * * ${FETCH_PREFIX} >> ${STORAGE_PATH}/logs/fetch.log 2>&1"
-UPDATE_CRON="30 * * * * ${UPDATE_PREFIX} >> ${STORAGE_PATH}/logs/update.log 2>&1"
+# --- Cron entries (liquidsoap user's crontab already exists from package) -----
+CRON_FETCH="0 * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh fetch_podcasts.rb --fetch-all >> ${STORAGE_ROOT}/logs/fetch_cron.log 2>&1"
+CRON_UPDATE="30 * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh update_playlist.rb >> ${STORAGE_ROOT}/logs/update_cron.log 2>&1"
 
-sudo -u "$LIQUIDSOAP_USER" crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_ls_rb.$$ || true
-echo "$FETCH_CRON"  >> /tmp/cron_ls_rb.$$
-echo "$UPDATE_CRON" >> /tmp/cron_ls_rb.$$
-sudo -u "$LIQUIDSOAP_USER" crontab /tmp/cron_ls_rb.$$
-rm -f /tmp/cron_ls_rb.$$
+CURRENT_CRONTAB=$(crontab -u liquidsoap -l 2>/dev/null || true)
+NEW_CRONTAB="${CURRENT_CRONTAB}"
+if ! echo "${NEW_CRONTAB}" | grep -qF "fetch_podcasts.rb --fetch-all"; then
+    NEW_CRONTAB="${NEW_CRONTAB}${NEW_CRONTAB:+$'\n'}${CRON_FETCH}"
+fi
+if ! echo "${NEW_CRONTAB}" | grep -qF "update_playlist.rb"; then
+    NEW_CRONTAB="${NEW_CRONTAB}${NEW_CRONTAB:+$'\n'}${CRON_UPDATE}"
+fi
+echo "${NEW_CRONTAB}" | crontab -u liquidsoap -
+echo "==> Cron entries installed for user liquidsoap"
 
-crontab -l 2>/dev/null | grep -vF "fetch_podcasts.rb" | grep -vF "update_playlists.rb" > /tmp/cron_root_rb.$$ || true
-crontab /tmp/cron_root_rb.$$
-rm -f /tmp/cron_root_rb.$$
+echo
+echo "==> Done. Review ${CONFIG_JSON}, then:"
+echo "    systemctl start ${SERVICE_NAME}"
 
-# ---------------------------------------------------------------------------
-# 12. Enable services
-# ---------------------------------------------------------------------------
-systemctl enable icecast2 "$SERVICE_NAME"
-echo "==> Enabling icecast2 and ${SERVICE_NAME} at boot."
-
-echo ""
-echo "============================================================"
-echo " Installation complete."
-echo ""
-echo " Next steps:"
-echo "   1. Drop background music into ${STORAGE_PATH}/music/"
-echo "   2. Edit ${INSTALL_DIR}/schedule.txt for scheduled shows"
-echo "   3. Review ${INSTALL_DIR}/station.liq"
-echo "   4. Start: systemctl start icecast2 ${SERVICE_NAME}"
-echo "============================================================"

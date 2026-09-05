@@ -1,717 +1,634 @@
 #!/usr/bin/env jruby
 # frozen_string_literal: true
 #
-# fetch_podcasts.rb - Podcast subscription management and episode fetching
-# for the liquidsoap radio automation stack (JRuby/Sequel variant).
+# fetch_podcasts.rb - Podcast subscription management for the radio automation.
 #
-# Concurrency: exclusive non-blocking File.lock (state/radio.lock) shared with
-# update_playlists.rb; skips cleanly if the sibling holds it. Databases run in
-# WAL mode with a busy timeout as a second safety net.
+# Manages the shows table in subscriptions.db and the episodes table in played.db.
+# Automatically syncs with gpodder.net on every invocation (if enabled in config).
 #
-# Politeness: audio/video verdict cached in shows.media_class; gpodder OPML
-# pull uses bounded retry with exponential backoff + jitter.
+# Usage:
+#   fetch_podcasts.rb --add-show <url>
+#   fetch_podcasts.rb --list [--detail]
+#   fetch_podcasts.rb --remove <slug-or-url>
+#   fetch_podcasts.rb --fetch-all
+#   fetch_podcasts.rb --import-opml <file>
+#   fetch_podcasts.rb --archive <slug>
+#   fetch_podcasts.rb --unarchive <slug>
 
-# ---------------------------------------------------------------------------
-# Gem path bootstrap: pin GEM_HOME/GEM_PATH before any require so the script
-# finds its gems regardless of how it was launched (sudo strips them by
-# default via env_reset). Derived from this file's own location so the
-# scripts are relocatable. We PREPEND our .gems dir to the existing GEM_PATH
-# rather than replacing it, so JRuby's shared/stdlib path stays reachable.
-# Guards prevent overriding an explicit environment.
-# ---------------------------------------------------------------------------
-SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
-GEMS_DIR   = File.join(SCRIPT_DIR, ".gems")
-ENV["GEM_HOME"] = GEMS_DIR unless ENV["GEM_HOME"]
-_existing_gem_path = ENV["GEM_PATH"].to_s.split(":").reject(&:empty?)
-ENV["GEM_PATH"] = ([GEMS_DIR] + _existing_gem_path).uniq.join(":")
-Gem.paths = { "GEM_HOME" => ENV["GEM_HOME"], "GEM_PATH" => ENV["GEM_PATH"] }
-
-require "sequel"
-require "net/http"
-require "openssl"
 require "json"
-require "logger"
-require "time"
-require "fileutils"
-require "cgi"
-require "base64"
-require "securerandom"
-require "rexml/document"
+require "net/http"
+require "uri"
+require "digest/md5"
+require "sequel"
+require "nokogiri"
 
-ROOT = SCRIPT_DIR
-CONFIG_PATH = File.join(ROOT, "config.json")
-
-AUDIO_EXTS = [".mp3", ".m4a"].freeze
-VIDEO_EXTS = [".mp4", ".mov", ".avi", ".webm", ".mkv"].freeze
-
-$state_dir = nil
-$subs_db_path = nil
-$played_db_path = nil
-$podcasts_dir = nil
-$logs_dir = nil
-$playlists_dir = nil
-$lock_file = nil
+SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
+CONFIG_PATH = File.join(SCRIPT_DIR, "config.json")
 
 def load_config
-  JSON.parse(File.read(CONFIG_PATH))
+  raw = JSON.parse(File.read(CONFIG_PATH))
+  storage = raw["storage"] || "/mnt/storage/radio"
+  icecast = raw["icecast"] || {}
+  gpodder = raw["gpodder"] || {}
+  {
+    :storage => storage,
+    :icecast_host => icecast["host"] || "127.0.0.1",
+    :icecast_port => icecast["port"].to_i,
+    :icecast_mount => icecast["mount"] || "/data",
+    :icecast_source_user => icecast["source_username"] || "source",
+    :icecast_source_pass => icecast["source_password"] || "",
+    :gpodder_enable => gpodder["enable"] == true,
+    :gpodder_host => gpodder["host"] || "https://gpodder.net",
+    :gpodder_user => gpodder["username"] || "",
+    :gpodder_pass => gpodder["password"] || "",
+    :gpodder_device_id => gpodder["device_id"] || ""
+  }
 end
 
-def init_paths!
-  cfg = load_config
-  storage = File.realpath(cfg["storage"])
-  $state_dir      = File.join(storage, "state")
-  $subs_db_path   = File.join($state_dir, "subscriptions.db")
-  $played_db_path = File.join($state_dir, "played.db")
-  $podcasts_dir   = File.join(storage, "podcasts")
-  $logs_dir       = File.join(storage, "logs")
-  $playlists_dir  = File.join(storage, "playlists")
-  $lock_file      = File.join($state_dir, "radio.lock")
-end
+CFG = load_config
+STORAGE_ROOT = CFG[:storage]
+STATE_DIR = File.join(STORAGE_ROOT, "state")
+LOGS_DIR = File.join(STORAGE_ROOT, "logs")
+TMP_DIR = File.join(STATE_DIR, "tmp")
+SUBS_DB = File.join(STATE_DIR, "subscriptions.db")
+PLAYED_DB = File.join(STATE_DIR, "played.db")
+LOG_FILE = File.join(LOGS_DIR, "fetch_cron.log")
 
-$log = Logger.new(STDOUT)
-$log.formatter = proc { |msg, _severity, _time, _progname| "#{Time.now} [INFO] #{msg}\n" }
-
-def log_error(msg)
-  $log.error(msg)
-end
-
-def setup_logging!
-  $log.instance_variable_set(:@logdev,
-    Logger::LogDevice.new([STDOUT, File.join($logs_dir, "fetch.log")]))
-end
-
-# ---------------------------------------------------------------------------
-# Mutual exclusion via flock on a shared lockfile.
-# ---------------------------------------------------------------------------
-$lock_fh = nil
-
-def acquire_lock!
-  Dir.mkdir($state_dir) unless Dir.exist?($state_dir)
-  fh = File.open($lock_file, File::RDWR | File::CREAT, 0o644)
-  begin
-    fh.flock(File::LOCK_EX | File::LOCK_NB)
-  rescue Errno::EACCES, Errno::EAGAIN
-    fh.close
-    return false
+def ensure_dir(path)
+  return if Dir.exist?(path)
+  parent = File.dirname(path)
+  unless path.start_with?("/")
+    raise ArgumentError, "ensure_dir requires an absolute path, got: #{path}"
   end
-  fh.truncate(0)
-  fh.write(Process.pid.to_s)
-  fh.rewind
-  $lock_fh = fh
-  true
-end
-
-def release_lock!
-  return if $lock_fh.nil?
-  begin
-    $lock_fh.flock(File::LOCK_UN)
-    $lock_fh.close
-  ensure
-    $lock_fh = nil
+  components = path.split("/").reject(&:empty?)
+  current = "/"
+  components.each do |comp|
+    current = File.join(current, comp)
+    unless Dir.exist?(current)
+      begin
+        Dir.mkdir(current)
+      rescue Errno::EEXIST
+        nil
+      end
+    end
   end
 end
 
-# ---------------------------------------------------------------------------
-# Schema: single source of truth, applied idempotently via raw SQL through
-# Database#execute. Raw DDL avoids the Sequel create_table/alter_table DSL,
-# which is unreliable under JRuby (instance_exec'd generator methods can
-# resolve to nil). Works identically on CRuby and JDBC.
-# ---------------------------------------------------------------------------
-SHOWS_SQL = <<~SQL.freeze
-  CREATE TABLE IF NOT EXISTS shows (
-    slug        TEXT PRIMARY KEY,
-    guid        TEXT NOT NULL UNIQUE,
-    name        TEXT NOT NULL,
-    feed_url    TEXT NOT NULL UNIQUE,
-    source      TEXT DEFAULT 'manual',
-    opml_import INTEGER DEFAULT 0,
-    archived    INTEGER DEFAULT 1,
-    media_class TEXT,
-    created_at  TEXT
-  );
-SQL
+[STORAGE_ROOT, STATE_DIR, LOGS_DIR, TMP_DIR].each { |d| ensure_dir(d) }
 
-EPISODES_SQL = <<~SQL.freeze
-  CREATE TABLE IF NOT EXISTS episodes (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    show_slug     TEXT NOT NULL,
-    guid          TEXT NOT NULL,
-    title         TEXT,
-    file_path     TEXT,
-    enclosure_url TEXT,
-    runlength     INTEGER,
-    played        INTEGER DEFAULT 0,
-    played_at     TEXT,
-    UNIQUE (show_slug, guid)
-  );
-SQL
+$log_fh = File.open(LOG_FILE, "a+")
 
-INDEX_EPISODES_SQL = <<~SQL.freeze
-  CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played);
-SQL
-
-def tune(db)
-  # Plain-SQL pragmas via Database#execute, which works on CRuby and JRuby/JDBC
-  # across all modern Sequel versions (the :pragma extension is CRuby-only and
-  # db.sql requires Sequel >= 5.42).
-  db.execute("PRAGMA journal_mode=WAL;")
-  db.execute("PRAGMA busy_timeout=5000;")
+def log(level, msg)
+  ts = Time.now.strftime("%Y-%m-%d %H:%M:%S")
+  line = "[#{ts}] [#{level}] #{msg}"
+  $log_fh.write(line + "\n")
+  $log_fh.flush
+  puts line
+rescue Exception => e
+  puts "LOG ERROR: #{e.class} #{e.message}"
 end
 
-def connect_subs
-  db = Sequel.connect("jdbc:sqlite:#{$subs_db_path}")
-  tune(db)
-  db.execute(SHOWS_SQL)
-  db
+$db_s = Sequel.connect("jdbc:sqlite:" + SUBS_DB)
+$db_p = Sequel.connect("jdbc:sqlite:" + PLAYED_DB)
+def table_count(db, tbl_name, col = :name)
+  db[:sqlite_master].where(type: "table", name: tbl_name).count
+rescue Exception => e
+  log("WARN", "count check failed for #{tbl_name}: #{e.class} #{e.message}")
+  0
 end
 
-def connect_played
-  db = Sequel.connect("jdbc:sqlite:#{$played_db_path}")
-  tune(db)
-  db.execute(EPISODES_SQL)
-  db.execute(INDEX_EPISODES_SQL)
-  db
-end
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def slugify(name)
-  s = name.downcase.gsub(/[^a-z0-9]+/, "_").gsub(/\A_+|_+\z/, "")
-  s = "show" if s.empty?
-  s[0, 60]
-end
-
-def gen_uuid
-  SecureRandom.uuid
-end
-
-def classify_feed(entries)
-  return "unknown" if entries.nil? || entries.empty?
-  entry = entries.first
-  enclosures = entry[:enclosures] || []
-  return "unknown" if enclosures.empty?
-  mime = (enclosures.first[:type] || "").downcase
-  return "audio" if mime.start_with?("audio/")
-  return "video" if mime.start_with?("video/")
-  url = (enclosures.first[:href] || "").downcase
-  return "audio" if AUDIO_EXTS.any? { |ext| url.end_with?(ext) }
-  return "video" if VIDEO_EXTS.any? { |ext| url.end_with?(ext) }
-  "unknown"
-end
-
-def get_media_class(db, slug)
-  row = db[:shows].where(slug: slug).first
-  row ? row[:media_class] : nil
-end
-
-def set_media_class(db, slug, cls)
-  db[:shows].where(slug: slug).update(media_class: cls)
-end
-
-# ---------------------------------------------------------------------------
-# Feed parsing (Net::HTTP + REXML)
-# ---------------------------------------------------------------------------
-def fetch_feed(feed_url)
-  uri = URI.parse(feed_url)
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = (uri.scheme == "https")
-  http.timeout = 60
-  resp = http.request(Net::HTTP::Get.new(uri.request_uri))
-  return nil unless resp.is_a?(Net::HTTPSuccess)
-
-  doc = REXML::Document.new(resp.body)
-  channel = doc.elements["//channel"]
-  return nil if channel.nil?
-
-  title = channel.elements["title"]&.text
-  entries = []
-  channel.get_elements("./item").each do |item|
-    link_el  = item.elements["link"]
-    title_el = item.elements["title"]
-    guid_el  = item.elements["guid"]
-    dur_el   = item.elements["media:duration"] || item.elements["itunes:duration"]
-    enc_el   = item.elements["enclosure"]
-
-    enclosures = []
-    if enc_el
-      enclosures << {
-        href:   enc_el.attributes["url"],
-        type:   enc_el.attributes["type"],
-        length: enc_el.attributes["length"]
-      }
+def ensure_schema
+  begin
+    if table_count($db_s, "shows").zero?
+      $db_s.execute <<-SQL
+        CREATE TABLE shows (
+          guid TEXT PRIMARY KEY,
+          slug TEXT UNIQUE NOT NULL,
+          title TEXT NOT NULL,
+          feed_url TEXT NOT NULL,
+          audio_only INTEGER DEFAULT 1,
+          archive INTEGER DEFAULT 0,
+          opml_import INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      SQL
+      log("INFO", "Created 'shows' table")
     end
 
-    entries << {
-      link:   link_el&.text,
-      title:  title_el&.text,
-      guid:   guid_el&.text,
-      enclosures: enclosures,
-      duration: dur_el&.text
+    if table_count($db_p, "episodes").zero?
+      $db_p.execute <<-SQL
+        CREATE TABLE episodes (
+          guid TEXT PRIMARY KEY,
+          show_guid TEXT NOT NULL,
+          title TEXT,
+          enclosure_url TEXT,
+          duration_seconds INTEGER,
+          published_date TEXT,
+          played INTEGER DEFAULT 0,
+          downloaded INTEGER DEFAULT 0,
+          local_path TEXT
+        )
+      SQL
+      log("INFO", "Created 'episodes' table")
+    end
+  rescue Exception => e
+    log("ERROR", "Schema setup failed: #{e.class} #{e.message}")
+    raise e
+  end
+end
+
+def table_exists?(db, tbl_name)
+  begin
+    db.from(:sqlite_master).where(name: tbl_name).count > 0
+  rescue Exception => e
+    log("WARN", "table_exists? check failed for '#{tbl_name}': #{e.class} #{e.message}")
+    false
+  end
+end
+
+ensure_schema
+
+def make_slug(title_str, feed_url)
+  base = title_str.to_s.downcase.gsub(/[^a-z0-9]+/, "_").gsub(/^_+|_+$/, "")
+  base = "show" if base.empty?
+  suffix = Digest::MD5.hexdigest(feed_url)[0..3]
+  candidate = "#{base}_#{suffix}"
+  existing = $db_s[:shows].select_map(:slug)
+  i = 1
+  while existing.include?(candidate)
+    i += 1
+    candidate = "#{base}_#{suffix}_#{i}"
+  end
+  candidate
+end
+
+def gen_guid(seed_str)
+  Digest::MD5.hexdigest(seed_str)
+end
+
+def http_stream_to_file(url, dest_path, user = nil, pass = nil)
+  uri = URI.parse(url)
+  req = Net::HTTP::Get.new(uri.path + (uri.query ? "?#{uri.query}" : ""))
+  if user && pass
+    req.basic_auth(user, pass)
+  end
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = (uri.scheme == "https")
+  http.open_timeout = 30
+  http.read_timeout = 60
+  success = false
+  begin
+    http.request(req) do |r|
+      if r.is_a?(Net::HTTPSuccess)
+        File.open(dest_path, "wb") do |f|
+          r.read_body { |chunk| f.write(chunk) }
+        end
+        size = File.size(dest_path)
+        log("INFO", "Downloaded #{size} bytes from #{url}")
+        success = true
+      else
+        log("ERROR", "HTTP #{r.code} fetching #{url}")
+      end
+    end
+  rescue Exception => e
+    log("ERROR", "Failed to download #{url}: #{e.class} #{e.message}")
+  end
+  success
+end
+
+def parse_feed(data={})
+  result = {:title => "Untitled Show", :description => "", :episodes => []}
+  unless data.is_a?(::Hash)
+    raise "You MUST provide a Hash with file_path and feed_url specified. You passed #{data.inspect}"
+  end
+  file_path = data[:file_path]
+  unless file_path
+    raise "You MUST provide a Hash with file_path and feed_url specified. You passed #{data.inspect}"
+  end
+  feed_url = data[:feed_url]
+  unless feed_url
+    raise "You MUST provide a Hash with file_path and feed_url specified. You passed #{data.inspect}"
+  end
+  #
+  document = Nokogiri::XML(File.read(file_path))
+  unless document
+    raise "Failed to import XML document: #{file_path.inspect}"
+  end
+  channel = document.at_xpath("//channel")
+  if channel.nil?
+    log("ERROR", "No <channel> found in feed at #{feed_url}")
+  else
+    title_element = channel.at_xpath("./title")
+    description_element = channel.at_xpath("./description")
+    show_title = title_element ? title_element.text.strip : "Untitled Show"
+    show_description = description_element ? description_element.text.strip : ""
+    #
+    episodes = []
+    channel.elements("item").each do |item|
+      #
+      episode_title_element = item.at_xpath("./title")
+      enclosure_element = item.at_xpath("./enclosure")
+      guid_element = item.at_xpath("./guid")
+      duration_element = item.at_xpath(".//duration")
+      publication_date_element = item.at_xpath("./pubDate")
+      #
+      episode_title = episode_title_element ? episode_title_element.text.strip : "Untitled"
+      enclosure_url = enclosure_element ? enclosure_element.attribute("url").to_s.strip : ""
+      enclosure_type = enclosure_element ? enclosure_element.attribute("type").to_s.strip : ""
+      enclosure_length = enclosure_element ? enclosure_element.attribute("length").to_s.strip.to_i : 0
+      episode_guid = guid_element ? guid_element.text.strip : ""
+      episode_duration = duration_element ? duration_element.text.strip.to_i : 0
+      episode_publication_date = publication_date_element ? publication_date_element.text.strip : ""
+      #
+      if enclosure_url.empty? || enclosure_type =~ /video/i
+        next
+      else
+        #
+        if episode_guid.empty?
+          episode_guid = gen_guid("#{enclosure_url}#{episode_title}")
+        end
+        if episode_duration <= 0 && enclosure_length > 0
+          episode_duration = (enclosure_length / (128 * 1024)).to_i
+        end
+        #
+        episodes << {:guid => episode_guid, :title => episode_title, :url => enclosure_url, :duration_seconds => episode_duration, :published_at => episode_publication_date, :file_size_bytes => enclosure_length}
+        #
+      end
+      #
+    end
+    #
+    result = {:title => show_title, :description => show_description, :episodes => episodes}
+    #
+  end
+  #
+  result
+end
+
+
+def parse_feed_from_file(file_path="", feed_url="")
+  doc = Nokogiri::XML(File.read(file_path))
+  channel = doc.at_xpath("//channel")
+  if channel.nil?
+    log("ERROR", "No <channel> found in feed at #{feed_url}")
+    return nil
+  end
+
+  title_el = channel.at_xpath("./title")
+  desc_el = channel.at_xpath("./description")
+  show_title = title_el ? title_el.text.strip : "Unknown Show"
+  show_desc = desc_el ? desc_el.text.strip : ""
+
+  episodes = []
+  channel.elements("item").each do |item|
+    ep_title_el = item.at_xpath("./title")
+    enc_el = item.at_xpath("./enclosure")
+    guid_el = item.at_xpath("./guid")
+    dur_el = item.at_xpath(".//duration")
+    pub_el = item.at_xpath("./pubDate")
+
+    ep_title = ep_title_el ? ep_title_el.text.strip : "Untitled"
+    enc_url = enc_el ? enc_el.attribute("url").to_s.strip : ""
+    enc_type = enc_el ? enc_el.attribute("type").to_s.strip : ""
+    enc_len = enc_el ? enc_el.attribute("length").to_s.strip.to_i : 0
+    ep_guid = guid_el ? guid_el.text.strip : ""
+    ep_dur = dur_el ? dur_el.text.strip.to_i : 0
+    ep_pub = pub_el ? pub_el.text.strip : ""
+
+    next if enc_url.empty?
+
+    if enc_type =~ /video/i
+      next
+    end
+
+    if ep_guid.empty?
+      ep_guid = gen_guid("#{enc_url}#{ep_title}")
+    end
+
+    if ep_dur <= 0 && enc_len > 0
+      ep_dur = (enc_len / (128 * 1024)).to_i
+    end
+
+    episodes << {
+      :guid => ep_guid,
+      :title => ep_title,
+      :url => enc_url,
+      :duration_seconds => ep_dur,
+      :published_at => ep_pub,
+      :file_size_bytes => enc_len
     }
   end
 
-  { title: title, entries: entries }
-rescue StandardError => e
-  log_error("Feed parse error for #{feed_url}: #{e.message}")
-  nil
+  {
+    :title => show_title,
+    :description => show_desc,
+    :episodes => episodes
+  }
 end
 
-# ---------------------------------------------------------------------------
-# gPodder sync with bounded retry + exponential backoff + jitter
-# ---------------------------------------------------------------------------
-def gpodder_sync(cfg)
-  g = cfg["gpodder"]
-  base = g["host"].chomp("/")
-  username = g["username"]
-  password = g["password"]
-  path = "/subscriptions/#{CGI.escape(username)}.opml"
-
-  puts "--- Syncing subscriptions from #{base} ---"
-  puts "Fetching subscriptions for '#{username}'..."
-
-  max_attempts = 4
-  backoff_base = 2.0
-  resp = nil
-
-  max_attempts.times do |attempt|
-    begin
-      uri = URI.parse("#{base}#{path}")
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = (uri.scheme == "https")
-      http.timeout = 60
-      req = Net::HTTP::Get.new(uri.request_uri)
-      credentials = Base64.strict_encode64("#{username}:#{password}")
-      req["Authorization"] = "Basic #{credentials}"
-      req["User-Agent"] = "radio-automation/1.0"
-      resp = http.request(req)
-      break
-    rescue StandardError => e
-      if attempt == max_attempts - 1
-        log_error("gPodder sync failed after #{attempt + 1} attempts: #{e.class.name}")
-        return []
-      end
-      delay = (backoff_base ** (attempt + 1)) + rand
-      $log.warn("gPodder request error (#{e.class.name}); retrying in #{delay.round(1)}s")
-      sleep(delay)
-    end
+def register_show(parsed, feed_url)
+  slug = make_slug(parsed[:title], feed_url)
+  show_guid = gen_guid(feed_url)
+  existing = $db_s[:shows].where(slug: slug).first
+  if existing
+    log("INFO", "Show already registered: #{parsed[:title]} (#{slug})")
+    return existing[:guid]
   end
 
-  return [] if resp.nil?
+  $db_s[:shows].insert(guid: show_guid, slug: slug, title: parsed[:title], feed_url: feed_url, audio_only: 1, archive: 0)
+  log("INFO", "Registered show: #{parsed[:title]} (#{slug})")
 
-  case resp.code.to_i
-  when 200
-    body = resp.body
-    return [] if body.strip.empty?
-    parse_opml(body)
-  when 401
-    log_error("gPodder sync failed: 401 Unauthorized. Check username/password in config.json.")
-  when 404
-    log_error("gPodder sync failed: 404 Not Found. User may not exist or has no subscriptions.")
-  when 429
-    log_error("gPodder sync throttled (429). Will retry next cycle.")
-  else
-    code = resp.code.to_i
-    if code >= 500
-      log_error("gPodder sync server error (#{code}). Will retry next cycle.")
-    else
-      log_error("gPodder sync failed: unexpected response #{code}: #{resp.body[0, 200]}")
-    end
-  end
-  []
-end
-
-def parse_opml(xml_string)
-  shows = []
-  doc = REXML::Document.new(xml_string)
-  doc.elements.each("//outline") do |outline|
-    feed_url = (outline.attributes["xmlUrl"] || "").strip
-    name     = (outline.attributes["text"] || "").strip
-    guid     = (outline.attributes["guid"] || "").strip
-    next unless feed_url.match?(/\Ahttps?:\/\//)
-    shows << { name: name, feed_url: feed_url, guid: guid.empty? ? nil : guid }
-  end
-  shows
-rescue REXML::ParseException => e
-  log_error("Failed to parse OPML XML: #{e.message}")
-  []
-end
-
-# ---------------------------------------------------------------------------
-# Show registration / pruning
-# ---------------------------------------------------------------------------
-def register_remote_shows(remote_shows)
-  db = connect_subs
-  added = 0
-  skipped_video = 0
-  remote_shows.each do |show|
-    slug = slugify(show[:name])
-    next if db[:shows].where(slug: slug).count > 0
-
-    parsed = fetch_feed(show[:feed_url])
-    if parsed.nil?
-      $log.warn("Skipping '#{show[:name]}': could not fetch feed.")
-      next
-    end
-    cls = classify_feed(parsed[:entries])
-    if cls == "video"
-      $log.info("Skipping '#{show[:name]}' (#{slug}): video podcast, not audio.")
-      skipped_video += 1
-      next
-    end
-    guid = show[:guid] || gen_uuid
-    db[:shows].insert(
-      slug: slug, guid: guid, name: show[:name], feed_url: show[:feed_url],
-      source: "gpodder", opml_import: 0, archived: 1, media_class: cls
+  parsed[:episodes].each do |ep|
+    $db_p[:episodes].insert(
+      guid: ep[:guid],
+      show_guid: show_guid,
+      title: ep[:title],
+      url: ep[:url],
+      duration_seconds: ep[:duration_seconds],
+      published_at: ep[:published_at],
+      played: 0,
+      downloaded: 0,
+      file_size_bytes: ep[:file_size_bytes]
     )
-    $log.info("Registered new show: #{show[:name]} (#{slug}) [#{cls}]")
-    added += 1
   end
-  db.disconnect
-  $log.info("Filtered out #{skipped_video} video podcast(s).") if skipped_video > 0
-  added
+
+  log("INFO", "Stored #{parsed[:episodes].size} episodes for #{slug}")
+  show_guid
 end
 
-def prune_stale_shows(remote_shows)
-  db = connect_subs
-  remote_slugs = remote_shows.map { |s| slugify(s[:name]) }.to_set
-  stale = db[:shows].where(source: "gpodder", opml_import: 0).all
-  removed = 0
-  stale.each do |row|
-    next if remote_slugs.include?(row[:slug])
-    remove_show_data(row[:slug])
-    db[:shows].where(slug: row[:slug]).delete
-    $log.info("Pruned stale show: #{row[:name]} (#{row[:slug]})")
-    removed += 1
+def cmd_add_show(url)
+  log("INFO", "Adding show: #{url}")
+  tmp_file = File.join(TMP_DIR, "feed_#{Process.pid}.xml")
+  ok = http_stream_to_file(url, tmp_file)
+  unless ok
+    log("ERROR", "Could not download feed: #{url}")
+    exit 1
   end
-  db.disconnect
-  removed
-end
-
-# ---------------------------------------------------------------------------
-# Episode extraction / download
-# ---------------------------------------------------------------------------
-def extract_duration(entry)
-  dur = entry[:duration]
-  if dur
-    return dur.to_i if dur.match?(/\A\d+\z/)
-    m = dur.match(/\APT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?\z/i)
-    if m
-      h  = m[1] ? m[1].to_i : 0
-      mn = m[2] ? m[2].to_i : 0
-      s  = m[3] ? m[3].to_i : 0
-      return h * 3600 + mn * 60 + s
-    end
-  end
-  enc = entry[:enclosures]&.first
-  if enc && enc[:length]
-    bytes = enc[:length].to_i
-    return (bytes * 8 / 128_000) if bytes > 0
-  end
-  nil
-end
-
-def download_episode(url, dest_dir, filename)
-  dest = File.join(dest_dir, filename)
-  return dest if File.exist?(dest)
-  uri = URI.parse(url)
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = (uri.scheme == "https")
-  http.timeout = 120
-  tmp = "#{dest}.part"
+  # ???
+  parsed = parse_feed({:file_path => tmp_file, :feed_url => url})
+  # parsed = parse_feed_from_file(tmp_file, url)
   begin
-    http.request_get(uri.request_uri) do |response|
-      raise "HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
-      File.open(tmp, "wb") do |f|
-        response.read_body { |chunk| f.write(chunk) }
-      end
-    end
-    File.rename(tmp, dest)
-    dest
-  rescue StandardError => e
-    log_error("Download failed for #{url}: #{e.message}")
-    File.delete(tmp) if File.exist?(tmp)
+    File.delete(tmp_file)
+  rescue Errno::ENOENT
     nil
   end
-end
 
-def safe_filename(title, fallback)
-  name = (title || "").gsub(/[^\w\s.\-]/, "").strip.tr(" ", "_")
-  name = fallback if name.empty?
-  "#{name[0, 120]}.mp3"
-end
-
-def show_archived?(db, slug)
-  row = db[:shows].where(slug: slug).first
-  row.nil? ? true : row[:archived] == 1
-end
-
-# ---------------------------------------------------------------------------
-# Per-show episode fetch
-# ---------------------------------------------------------------------------
-def fetch_show_episodes(slug, name, feed_url)
-  dest_dir = File.join($podcasts_dir, slug)
-  Dir.mkdir(dest_dir) unless Dir.exist?(dest_dir)
-
-  subs_db = connect_subs
-
-  cached_cls = get_media_class(subs_db, slug)
-  if cached_cls == "video"
-    subs_db.disconnect
-    return 0
-  end
-
-  parsed = fetch_feed(feed_url)
   if parsed.nil?
-    subs_db.disconnect
-    return 0
+    log("ERROR", "Could not parse feed: #{url}")
+    exit 1
   end
 
-  if cached_cls.nil?
-    cls = classify_feed(parsed[:entries])
-    set_media_class(subs_db, slug, cls)
-    if cls == "video"
-      $log.info("'#{name}' (#{slug}) classified as video; skipping.")
-      subs_db.disconnect
-      return 0
-    end
-  end
-
-  played_db = connect_played
-  seen = played_db[:episodes].where(show_slug: slug).select_map(:guid).to_set
-  archived = show_archived?(subs_db, slug)
-  new_count = 0
-
-  parsed[:entries].each do |entry|
-    guid = entry[:guid] || entry[:link] || entry[:title] || ""
-    next if seen.include?(guid)
-    enclosures = entry[:enclosures] || []
-    next if enclosures.empty?
-    mime = (enclosures.first[:type] || "").downcase
-    next if mime.start_with?("video/")
-    audio_url = enclosures.first[:href]
-    next if audio_url.nil? || audio_url.empty?
-
-    title = entry[:title] || "untitled"
-    duration = extract_duration(entry)
-
-    if archived
-      filename = safe_filename(title, guid[-20..])
-      file_path = download_episode(audio_url, dest_dir, filename)
-      next if file_path.nil?
-      insert_episode(played_db, slug, guid, title, file_path, audio_url, duration)
-    else
-      insert_episode(played_db, slug, guid, title, nil, audio_url, duration)
-    end
-    new_count += 1
-    kind = archived ? "downloaded" : "live"
-    $log.info("  New episode: #{title} [#{kind}]")
-  end
-
-  played_db.disconnect
-  subs_db.disconnect
-  new_count
+  register_show(parsed, url)
+  log("INFO", "Done adding show: #{parsed[:title]}")
 end
 
-def insert_episode(db, slug, guid, title, file_path, enclosure_url, duration)
-  # INSERT OR IGNORE semantics via the UNIQUE(show_slug, guid) constraint.
-  db.transaction do
-    db[:episodes].insert(
-      show_slug: slug, guid: guid, title: title,
-      file_path: file_path, enclosure_url: enclosure_url,
-      runlength: duration, played: 0
-    )
-  end
-rescue Sequel::UniqueConstraintViolation
-  # Already recorded; ignore.
-end
-
-def fetch_all_episodes
-  db = connect_subs
-  shows = db[:shows].order(:name).all
-  db.disconnect
-  total_new = 0
-  shows.each do |show|
-    $log.info("--- Fetching: #{show[:name]} (#{show[:slug]}) ---")
-    begin
-      n = fetch_show_episodes(show[:slug], show[:name], show[:feed_url])
-      total_new += n
-    rescue StandardError => e
-      log_error("Unexpected error fetching #{show[:slug]}: #{e.message}")
-    end
-  end
-  $log.info("=== Fetch complete: #{total_new} new episode(s) ===")
-end
-
-# ---------------------------------------------------------------------------
-# Administrative commands
-# ---------------------------------------------------------------------------
-def list_shows(detail: false)
-  db = connect_subs
-  rows = db[:shows].order(:name).all
-  db.disconnect
+def cmd_list(detail)
+  rows = $db_s[:shows].all
   if rows.empty?
     puts "No shows registered."
     return
   end
-  puts format("%-30s %-10s %-8s %-10s %s", "SLUG", "ARCHIVED", "MEDIA", "SOURCE", "NAME")
   rows.each do |r|
-    arch = r[:archived] == 1 ? "yes" : "no"
-    media = r[:media_class] || "?"
-    line = format("%-30s %-10s %-8s %-10s %s", r[:slug], arch, media, r[:source], r[:name])
-    line += "\n" + (" " * 50) + r[:feed_url] if detail
+    line = "%-30s %-40s arch=%d" % [r[:slug], r[:title], r[:archive]]
+    if detail
+      ep_count = $db_p[:episodes].where(show_guid: r[:guid]).count
+      played_count = $db_p[:episodes].where(show_guid: r[:guid], played: 1).count
+      line += " eps=#{ep_count} played=#{played_count}"
+    end
     puts line
   end
 end
 
-def add_show(feed_url)
-  parsed = fetch_feed(feed_url)
-  if parsed.nil? || parsed[:title].nil?
-    log_error("Could not determine show title from #{feed_url}")
-    return
-  end
-  cls = classify_feed(parsed[:entries])
-  if cls == "video"
-    log_error("Refusing to add '#{parsed[:title]}': video podcast detected.")
-    return
-  end
-  name = parsed[:title]
-  slug = slugify(name)
-  guid = gen_uuid
-  db = connect_subs
-  begin
-    db[:shows].insert(
-      slug: slug, guid: guid, name: name, feed_url: feed_url,
-      source: "manual", opml_import: 0, archived: 1, media_class: cls
-    )
-  rescue Sequel::UniqueConstraintViolation
-    # already present
-  end
-  db.disconnect
-  $log.info("Added show: #{name} (#{slug}) [#{cls}]")
-  fetch_show_episodes(slug, name, feed_url)
-end
-
-def set_archive(slug, value)
-  db = connect_subs
-  row = db[:shows].where(slug: slug).first
+def cmd_remove(slug_or_url)
+  row = $db_s[:shows].where(Sequel.or({slug: slug_or_url}, {feed_url: slug_or_url})).first
   if row.nil?
-    log_error("No show found with slug '#{slug}'.")
-    db.disconnect
+    log("ERROR", "Show not found: #{slug_or_url}")
+    exit 1
+  end
+  $db_p[:episodes].where(show_guid: row[:guid]).delete
+  $db_s[:shows].where(guid: row[:guid]).delete
+  log("INFO", "Removed show #{row[:slug]} and its episodes")
+end
+
+def cmd_fetch_all
+  rows = $db_s[:shows].all
+  if rows.empty?
+    log("INFO", "No shows to fetch.")
     return
   end
-  db[:shows].where(slug: slug).update(archived: value)
-  db.disconnect
-  state = value == 1 ? "archived" : "non-archived (live)"
-  $log.info("Show '#{row[:name]}' (#{slug}) is now #{state}.")
-end
-
-def remove_show_data(slug)
-  pod_dir = File.join($podcasts_dir, slug)
-  FileUtils.rm_rf(pod_dir) if Dir.exist?(pod_dir)
-  txt = File.join($playlists_dir, "#{slug}.txt")
-  File.delete(txt) if File.exist?(txt)
-end
-
-def delete_show(slug)
-  db = connect_subs
-  row = db[:shows].where(slug: slug).first
-  if row.nil?
-    log_error("No show found with slug '#{slug}'.")
-    db.disconnect
-    return
-  end
-  remove_show_data(slug)
-  db[:shows].where(slug: slug).delete
-  db.disconnect
-  played_db = connect_played
-  played_db[:episodes].where(show_slug: slug).delete
-  played_db.disconnect
-  $log.info("Deleted show: #{row[:name]} (#{slug})")
-end
-
-def import_opml(path)
-  content = File.read(path)
-  shows = parse_opml(content)
-  db = connect_subs
-  added = 0
-  skipped_video = 0
-  shows.each do |show|
-    slug = slugify(show[:name])
-    next if db[:shows].where(slug: slug).count > 0
-    parsed = fetch_feed(show[:feed_url])
+  rows.each do |show|
+    log("INFO", "Fetching: #{show[:title]} (#{show[:slug]})")
+    tmp_file = File.join(TMP_DIR, "feed_#{show[:slug]}_#{Process.pid}.xml")
+    ok = http_stream_to_file(show[:feed_url], tmp_file)
+    unless ok
+      log("ERROR", "Could not download feed: #{show[:feed_url]}")
+      next
+    end
+    # ???
+    parsed = parse_feed({:file_path => tmp_file, :feed_url => show[:feed_url]})
+    # parsed = parse_feed_from_file(tmp_file, show[:feed_url])
+    begin
+      File.delete(tmp_file)
+    rescue Errno::ENOENT
+      nil
+    end
     if parsed.nil?
-      $log.warn("OPML import: skipping '#{show[:name]}', could not fetch feed.")
+      log("ERROR", "Could not parse feed: #{show[:feed_url]}")
       next
     end
-    cls = classify_feed(parsed[:entries])
-    if cls == "video"
-      $log.info("OPML import: skipping '#{show[:name]}' (#{slug}): video podcast.")
-      skipped_video += 1
-      next
+    new_eps = 0
+    parsed[:episodes].each do |ep|
+      existing = $db_p[:episodes].where(guid: ep[:guid]).first
+      if existing.nil?
+        $db_p[:episodes].insert(
+          guid: ep[:guid],
+          show_guid: show[:guid],
+          title: ep[:title],
+          url: ep[:url],
+          duration_seconds: ep[:duration_seconds],
+          published_at: ep[:published_at],
+          played: 0,
+          downloaded: 0,
+          file_size_bytes: ep[:file_size_bytes]
+        )
+        new_eps += 1
+      end
     end
-    guid = show[:guid] || gen_uuid
-    db[:shows].insert(
-      slug: slug, guid: guid, name: show[:name], feed_url: show[:feed_url],
-      source: "opml", opml_import: 1, archived: 1, media_class: cls
-    )
-    added += 1
+    log("INFO", "#{new_eps} new episodes for #{show[:slug]}")
   end
-  db.disconnect
-  $log.info("OPML import: #{added} added, #{skipped_video} video shows filtered out.")
 end
 
-def run_fetch(config)
-  g = config["gpodder"]
-  if g["enable"] == true
-    remote = gpodder_sync(config)
-    if remote.empty?
-      $log.warn("No subscriptions retrieved from gPodder; using local registry only.")
-    else
-      added = register_remote_shows(remote)
-      pruned = prune_stale_shows(remote)
-      $log.info("Sync: #{added} added, #{pruned} pruned.")
+def cmd_import_opml(opml_file)
+  doc = Nokogiri::XML(File.read(opml_file))
+  outlines = doc.xpath("//outline[@type='rss']")
+  count = 0
+  outlines.each do |o|
+    url = o.attribute("xmlUrl").to_s.strip
+    next if url.empty?
+    cmd_add_show(url)
+    count += 1
+  end
+  log("INFO", "Imported #{count} shows from OPML")
+end
+
+def cmd_archive(slug)
+  row = $db_s[:shows].where(slug: slug).first
+  if row.nil?
+    log("ERROR", "Show not found: #{slug}")
+    exit 1
+  end
+  $db_s[:shows].where(guid: row[:guid]).update(archive: 1)
+  log("INFO", "Archived show: #{slug}")
+end
+
+def cmd_unarchive(slug)
+  row = $db_s[:shows].where(slug: slug).first
+  if row.nil?
+    log("ERROR", "Show not found: #{slug}")
+    exit 1
+  end
+  $db_s[:shows].where(guid: row[:guid]).update(archive: 0)
+  log("INFO", "Unarchived show: #{slug}")
+end
+
+def sync_gpodder
+  unless CFG[:gpodder_enable]
+    return
+  end
+  
+  log("DEBUG", "Sync check: enable=#{CFG[:gpodder_enable]}, user=#{CFG[:gpodder_user]}, device=#{CFG[:gpodder_device_id]}")
+  
+  device_id = CFG[:gpodder_device_id].to_s.strip
+  if device_id.empty?
+    log("WARN", "gPodder sync enabled but no device_id configured; skipping.")
+    return
+  end
+  
+  host = CFG[:gpodder_host].to_s.strip
+  user = CFG[:gpodder_user].to_s.strip
+  pass = CFG[:gpodder_pass].to_s
+  full_host = host.start_with?("http") ? host : "https://#{host}"
+  api_url   = "#{full_host}/subscriptions/#{user}/#{device_id}.opml"
+  tmp_file  = File.join(TMP_DIR, "gpodder_sync_#{Process.pid}.opml")
+  
+  ok = http_stream_to_file(api_url, tmp_file, user, pass)
+  unless ok
+    log("WARN", "gPodder sync failed to download: #{api_url}")
+    return
+  end
+  
+  begin
+    doc = Nokogiri::XML(File.read(tmp_file))
+  rescue Exception => e
+    log("WARN", "gPodder sync: failed to parse OPML: #{e.message}")
+    return
+  ensure
+    begin
+      File.delete(tmp_file)
+    rescue Errno::ENOENT
+      nil
     end
   end
-  fetch_all_episodes
+  
+  outlines = doc.xpath("//outline[@xmlUrl]").map do |o|
+    {
+      url:   o.attr("xmlUrl").to_s.strip,
+      title: o.attr("title").to_s.strip
+    }
+  end
+  
+  remote_urls = outlines.map { |o| o[:url] }.select { |u| !u.empty? }
+  added = 0
+  
+  outlines.each do |o|
+    next if o[:url].empty?
+    
+    existing = $db_s[:shows].where(feed_url: o[:url]).first
+    if existing.nil?
+      log("INFO", "gPodder sync: registering new show #{o[:title]}")
+      tmp_feed = File.join(TMP_DIR, "gpodder_feed_#{Process.pid}.xml")
+      fok = http_stream_to_file(o[:url], tmp_feed)
+      
+      if fok
+        # ???
+        parsed = parse_feed({:file_path => tmp_feed, :feed_url => o[:url]})
+        # parsed = parse_feed_from_file(tmp_feed, o[:url])
+        
+        begin
+          File.delete(tmp_feed)
+        rescue Errno::ENOENT
+          nil
+        end
+        
+        if parsed
+          register_show(parsed, o[:url])
+          added += 1
+        end
+      end
+    end
+  end
+  
+  pruned = 0
+  $db_s[:shows].all.each do |row|
+    if row[:opml_import].to_i == 0 && !remote_urls.include?(row[:feed_url].to_s)
+      $db_p[:episodes].where(show_guid: row[:guid]).delete
+      $db_s[:shows].where(guid: row[:guid]).delete
+      pruned += 1
+      log("INFO", "gPodder sync: pruned '#{row[:slug]}'")
+    end
+  end
+  
+  log("INFO", "gPodder sync complete: #{added} added, #{pruned} removed")
 end
 
 def main
   args = ARGV.dup
-  option = args.shift
-
-  init_paths!
-  [$state_dir, $logs_dir, $podcasts_dir, $playlists_dir].each do |dir|
-    Dir.mkdir(dir) unless Dir.exist?(dir)
-  end
-  setup_logging!
-
-  config = load_config
-
-  case option
-  when "--list-shows"
-    list_shows(detail: args.include?("--detail"))
+  command = args.shift
+  sync_gpodder
+  case command
   when "--add-show"
-    add_show(args.first)
-  when "--delete-show"
-    delete_show(args.first)
-  when "--archive"
-    set_archive(args.first, 1)
-  when "--unarchive"
-    set_archive(args.first, 0)
+    url = args.shift
+    if url.nil?
+      puts "Usage: fetch_podcasts.rb --add-show <url>"
+      exit 1
+    end
+    cmd_add_show(url)
+  when "--list"
+    detail = args.include?("--detail")
+    cmd_list(detail)
+  when "--remove"
+    slug = args.shift
+    if slug.nil?
+      puts "Usage: fetch_podcasts.rb --remove <slug-or-url>"
+      exit 1
+    end
+    cmd_remove(slug)
+  when "--fetch-all"
+    cmd_fetch_all
   when "--import-opml"
-    import_opml(args.first)
+    opml_file = args.shift
+    if opml_file.nil?
+      puts "Usage: fetch_podcasts.rb --import-opml <file>"
+      exit 1
+    end
+    cmd_import_opml(opml_file)
+  when "--archive"
+    slug = args.shift
+    if slug.nil?
+      puts "Usage: fetch_podcasts.rb --archive <slug>"
+      exit 1
+    end
+    cmd_archive(slug)
+  when "--unarchive"
+    slug = args.shift
+    if slug.nil?
+      puts "Usage: fetch_podcasts.rb --unarchive <slug>"
+      exit 1
+    end
+    cmd_unarchive(slug)
   else
-    if !acquire_lock!
-      $log.info("Another radio process holds the lock; skipping this run.")
-      return
-    end
-    begin
-      run_fetch(config)
-    ensure
-      release_lock!
-    end
+    puts "Usage: fetch_podcasts.rb [--add-show <url>|--list|--remove <slug>|--fetch-all|--import-opml <file>|--archive <slug>|--unarchive <slug>]"
   end
 end
 
 main if __FILE__ == $PROGRAM_NAME
+

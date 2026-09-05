@@ -1,270 +1,313 @@
 #!/usr/bin/env bash
+# install_for_python - Radio automation installer for Linux Mint 22.3
 #
-# install_for_python - Provision the Python radio automation stack.
-# Idempotent: safe to re-run. Derives the service name from this file's
-# containing directory basename. Must be run as root.
+# Installs the liquidsoap-based radio automation stack:
+#   - Creates the 'liquidsoap' system user
+#   - Prompts for storage path, Icecast credentials, gpodder.net credentials
+#   - Generates config.json from the answers
+#   - Sets up directory structure under <storage>/
+#   - Ensures SQLite databases exist with correct schema
+#   - Installs JRuby gems (sequel, jdbc-sqlite3, nokogiri, json) one at a time
+#   - Writes the self-locating run_radio.sh launcher
+#   - Installs crontab entries (as liquidsoap) for periodic fetch + update
+#   - Optionally enables the systemd service
 #
+# Usage: sudo ./install_for_python
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Derive service name from containing directory name
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_NAME="$(basename "$SCRIPT_DIR")"
+SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+
+echo "=== ${SERVICE_NAME} Installer ==="
+echo
+
+# ---------------------------------------------------------------------------
+# Root check
+# ---------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: this installer must be run as root." >&2
-    exit 1
-fi
-
-INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_NAME="$(basename "$INSTALL_DIR")"
-UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-LIQUIDSOAP_USER="liquidsoap"
-
-echo "==> Installing ${SERVICE_NAME} (Python stack) from ${INSTALL_DIR}"
-
-# ---------------------------------------------------------------------------
-# 1. Base packages
-# ---------------------------------------------------------------------------
-echo "==> Ensuring base packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq \
-    python3 python3-pip python3-venv \
-    liquidsoap icecast2 jq curl ca-certificates >/dev/null
-
-# Ensure the dedicated service user exists.
-if ! id -u "$LIQUIDSOAP_USER" >/dev/null 2>&1; then
-    useradd --system --create-home --shell /usr/sbin/nologin "$LIQUIDSOAP_USER"
-    echo "    created system user '${LIQUIDSOAP_USER}'"
+  echo "ERROR: Please run as root (sudo)." >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Interactive configuration (defaults from existing config.json)
+# Create liquidsoap system user if missing
 # ---------------------------------------------------------------------------
-CONFIG_JSON="${INSTALL_DIR}/config.json"
-
-prompt() {
-    local prompt_text="$1" default="${2:-}"
-    local current=""
-    if [[ -n "$default" ]]; then
-        read -rp "${prompt_text} [${default}]: " current || true
-        echo "${current:-$default}"
-    else
-        read -rp "${prompt_text}: " current || true
-        echo "$current"
-    fi
-}
-
-existing_storage="" ; existing_ic_host="" ; existing_ic_port=""
-existing_ic_mount="" ; existing_ic_user="" ; existing_ic_pass=""
-existing_gp_enable="" ; existing_gp_host="" ; existing_gp_user="" ; existing_gp_pass=""
-
-if [[ -f "$CONFIG_JSON" ]]; then
-    echo "==> Found existing config.json; using it for defaults."
-    existing_storage=$(jq -r '.storage // empty' "$CONFIG_JSON")
-    existing_ic_host=$(jq -r '.icecast.host // empty' "$CONFIG_JSON")
-    existing_ic_port=$(jq -r '.icecast.port // empty' "$CONFIG_JSON")
-    existing_ic_mount=$(jq -r '.icecast.mount // empty' "$CONFIG_JSON")
-    existing_ic_user=$(jq -r '.icecast.username // empty' "$CONFIG_JSON")
-    existing_ic_pass=$(jq -r '.icecast.password // empty' "$CONFIG_JSON")
-    existing_gp_enable=$(jq -r '.gpodder.enable // empty' "$CONFIG_JSON")
-    existing_gp_host=$(jq -r '.gpodder.host // empty' "$CONFIG_JSON")
-    existing_gp_user=$(jq -r '.gpodder.username // empty' "$CONFIG_JSON")
-    existing_gp_pass=$(jq -r '.gpodder.password // empty' "$CONFIG_JSON")
+if ! id -u liquidsoap >/dev/null 2>&1; then
+  echo "Creating system user 'liquidsoap'..."
+  useradd --system --create-home --shell /usr/sbin/nologin liquidsoap
+  echo "Done."
+else
+  echo "User 'liquidsoap' already exists."
 fi
 
-echo ""
-echo "--- Storage ---"
-STORAGE_PATH=$(prompt "Storage path (media + state + logs)" "${existing_storage:-/mnt/storage/radio}")
-[[ -z "$STORAGE_PATH" ]] && STORAGE_PATH="${existing_storage:-/mnt/storage/radio}"
+# ---------------------------------------------------------------------------
+# Prompt for configuration values
+# ---------------------------------------------------------------------------
+echo
+read -rp "Station data directory [/mnt/storage/radio]: " STORAGE
+STORAGE="${STORAGE:-/mnt/storage/radio}"
 
-echo ""
-echo "--- Icecast (source credentials) ---"
-IC_HOST=$(prompt "Icecast host" "$existing_ic_host");           IC_HOST=${IC_HOST:-localhost}
-IC_PORT=$(prompt "Icecast source port" "$existing_ic_port");     IC_PORT=${IC_PORT:-7777}
-IC_MOUNT=$(prompt "Mount point" "$existing_ic_mount");          IC_MOUNT=${IC_MOUNT:-/data}
-IC_USER=$(prompt "Source username" "$existing_ic_user");         IC_USER=${IC_USER:-source}
-read -rsp "Source password: " IC_PASS || true; echo;                   IC_PASS=${IC_PASS:-$existing_ic_pass}
+read -rp "Icecast host [192.168.0.200]: " ICECAST_HOST
+ICECAST_HOST="${ICECAST_HOST:-192.168.0.200}"
 
-echo ""
-echo "--- gPodder sync (optional) ---"
-GP_ENABLE=$(prompt "Enable gPodder sync? (true/false)" "$existing_gp_enable"); GP_ENABLE=${GP_ENABLE:-false}
-GP_HOST=$(prompt "gPodder host" "$existing_gp_host");            GP_HOST=${GP_HOST:-https://gpodder.net}
-GP_USER=$(prompt "gPodder username" "$existing_gp_user")
-read -rsp "gPodder password: " GP_PASS || true; echo;                  GP_PASS=${GP_PASS:-$existing_gp_pass}
+read -rp "Icecast source port [7777]: " ICECAST_PORT
+ICECAST_PORT="${ICECAST_PORT:-7777}"
 
-echo ""
-echo "Summary:"
-echo "  Storage : $STORAGE_PATH"
-echo "  Icecast : $IC_USER@$IC_HOST:$IC_PORT mount=$IC_MOUNT"
-echo "  gPodder : enabled=$GP_ENABLE ($GP_USER @ $GP_HOST)"
-read -rp "Proceed? [y/N]: " confirm || true
-case "$confirm" in
-    [Yy]*) ;;
-    *) echo "Aborted."; exit 0 ;;
-esac
+read -rp "Icecast mount point [/data]: " ICECAST_MOUNT
+ICECAST_MOUNT="${ICECAST_MOUNT:-/data}"
+
+read -rp "Icecast source username [source]: " SOURCE_USER
+SOURCE_USER="${SOURCE_USER:-source}"
+
+read -rsp "Icecast source password: " SOURCE_PASS
+echo
+
+GPODDER_ENABLE=""
+until [[ "$GPODDER_ENABLE" =~ ^[YyNn]$ ]]; do
+  read -rp "Enable gPodder.net sync? [y/N]: " GPODDER_ENABLE
+done
+GPODDER_ENABLED=false
+[[ "$GPODDER_ENABLE" =~ ^[Yy]$ ]] && GPODDER_ENABLED=true
+
+GPODDER_HOST="gpodder.net"
+GPODDER_USER=""
+GPODDER_PASS=""
+if [[ "$GPODDER_ENABLED" == true ]]; then
+  read -rp "gPodder.net host [gpodder.net]: " GPODDER_HOST_IN
+  GPODDER_HOST="${GPODDER_HOST_IN:-gpodder.net}"
+  read -rp "gPodder.net username: " GPODDER_USER
+  read -rsp "gPodder.net password: " GPODDER_PASS
+  echo
+fi
 
 # ---------------------------------------------------------------------------
-# 3. Create the directory tree
+# Create directory structure
 # ---------------------------------------------------------------------------
-echo "==> Creating directory tree under $STORAGE_PATH ..."
-mkdir -p "$STORAGE_PATH"/{music,podcasts,jingles,announcements,state,playlists,logs}
-chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$STORAGE_PATH"
+echo
+echo "Creating directory structure under ${STORAGE} ..."
+mkdir -p "${STORAGE}"/{state,podcasts,music,jingles,announcements,playlists,logs}
+chown -R liquidsoap:liquidsoap "${STORAGE}"
+chmod -R u+rwX,g+rwX,o+rX "${STORAGE}"
+echo "Done."
 
 # ---------------------------------------------------------------------------
-# 4. Write config.json (mode 600)
+# Generate config.json
 # ---------------------------------------------------------------------------
-echo "==> Writing $CONFIG_JSON ..."
-cat > "$CONFIG_JSON" <<EOF
+CONFIG_FILE="${SCRIPT_DIR}/config.json"
+cat > "$CONFIG_FILE" <<EOF
 {
-  "storage": "${STORAGE_PATH}",
+  "storage": "${STORAGE}",
   "icecast": {
-    "host": "${IC_HOST}",
-    "port": ${IC_PORT},
-    "mount": "${IC_MOUNT}",
-    "username": "${IC_USER}",
-    "password": "${IC_PASS}"
+    "host": "${ICECAST_HOST}",
+    "port": ${ICECAST_PORT},
+    "mount": "${ICECAST_MOUNT}",
+    "source_username": "${SOURCE_USER}",
+    "source_password": "${SOURCE_PASS}"
   },
   "gpodder": {
-    "enable": $( [[ "$GP_ENABLE" =~ ^([Tt][Rr][Uu][Ee]|1)$ ]] && echo true || echo false ),
-    "host": "${GP_HOST}",
-    "username": "${GP_USER}",
-    "password": "${GP_PASS}"
+    "enable": ${GPODDER_ENABLED},
+    "host": "https://${GPODDER_HOST}",
+    "username": "${GPODDER_USER}",
+    "password": "${GPODDER_PASS}"
   }
 }
 EOF
-chmod 600 "$CONFIG_JSON"
-chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$CONFIG_JSON"
+chown liquidsoap:liquidsoap "$CONFIG_FILE"
+chmod 640 "$CONFIG_FILE"
+echo "Wrote ${CONFIG_FILE}"
 
 # ---------------------------------------------------------------------------
-# 5. Initialize BOTH SQLite databases with the full current schema.
-#    This guarantees a known-good baseline at install time, independent of
-#    which script runs first. Idempotent via IF NOT EXISTS.
+# Ensure SQLite databases exist with correct schema
 # ---------------------------------------------------------------------------
-echo "==> Initializing SQLite databases ..."
-python3 - "$STORAGE_PATH/state" <<'PYINIT'
-import sqlite3, sys, os
-state_dir = sys.argv[1]
+STATE_DIR="${STORAGE}/state"
+SUBS_DB="${STATE_DIR}/subscriptions.db"
+PLAYED_DB="${STATE_DIR}/played.db"
 
-subs = os.path.join(state_dir, "subscriptions.db")
-played = os.path.join(state_dir, "played.db")
+ensure_schema() {
+  local db="$1" table_sql="$2" index_sql="$3"
+  sqlite3 "$db" <<<"$table_sql"
+  [[ -n "$index_sql" ]] && sqlite3 "$db" <<<"$index_sql"
+  sqlite3 "$db" "PRAGMA journal_mode=WAL;"
+}
 
-conn = sqlite3.connect(subs)
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS shows (
-    slug TEXT PRIMARY KEY,
-    guid TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    feed_url TEXT NOT NULL UNIQUE,
-    source TEXT DEFAULT 'manual',
-    opml_import INTEGER DEFAULT 0,
-    archived INTEGER DEFAULT 1,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-""")
-conn.commit(); conn.close()
+SHOWS_SQL='CREATE TABLE IF NOT EXISTS shows (
+  slug        TEXT PRIMARY KEY,
+  guid        TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  feed_url    TEXT NOT NULL UNIQUE,
+  source      TEXT DEFAULT '"'"'manual'"'"',
+  opml_import INTEGER DEFAULT 0,
+  archived    INTEGER DEFAULT 1,
+  media_class TEXT,
+  created_at  TEXT
+);'
 
-conn = sqlite3.connect(played)
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS episodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    show_slug TEXT NOT NULL,
-    guid TEXT NOT NULL,
-    title TEXT,
-    file_path TEXT,
-    enclosure_url TEXT,
-    runlength INTEGER,
-    played INTEGER DEFAULT 0,
-    played_at TEXT,
-    UNIQUE(show_slug, guid)
-);
-CREATE INDEX IF NOT EXISTS idx_episodes_show_played
-    ON episodes (show_slug, played);
-""")
-conn.commit(); conn.close()
+EPISODES_SQL='CREATE TABLE IF NOT EXISTS episodes (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  show_slug     TEXT NOT NULL,
+  guid          TEXT NOT NULL,
+  title         TEXT,
+  file_path     TEXT,
+  enclosure_url TEXT,
+  runlength     INTEGER,
+  played        INTEGER DEFAULT 0,
+  played_at     TEXT,
+  UNIQUE (show_slug, guid)
+);'
 
-print("    subscriptions.db and played.db initialized.")
-PYINIT
-chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$STORAGE_PATH/state"
+INDEX_EPISODES_SQL='CREATE INDEX IF NOT EXISTS idx_episodes_show_played ON episodes (show_slug, played);'
+
+echo
+echo "Initializing SQLite databases..."
+ensure_schema "$SUBS_DB"   "$SHOWS_SQL"   ""
+ensure_schema "$PLAYED_DB" "$EPISODES_SQL" "$INDEX_EPISODES_SQL"
+chown liquidsoap:liquidsoap "$SUBS_DB" "$PLAYED_DB"
+echo "Done."
 
 # ---------------------------------------------------------------------------
-# 6. Python virtualenv + dependencies
+# Install JRuby runtime dependencies (one gem per command to bound memory)
 # ---------------------------------------------------------------------------
-VENV="${INSTALL_DIR}/.venv"
-if [[ ! -x "${VENV}/bin/python" ]]; then
-    echo "==> Creating Python venv at ${VENV} ..."
-    python3 -m venv "$VENV"
+JRUBY_BIN="/opt/jruby/bin/jruby"
+GEM_BIN="/opt/jruby/bin/gem"
+GEMS_HOME="${SCRIPT_DIR}/.gems"
+
+if [[ -x "$JRUBY_BIN" ]]; then
+  echo
+  echo "Installing JRuby gem dependencies into ${GEMS_HOME} ..."
+  mkdir -p "$GEMS_HOME"
+  chown liquidsoap:liquidsoap "$GEMS_HOME"
+
+  install_gem() {
+    local gem_name="$1"
+    shift
+    local extra_args=("$@")
+    echo "  -> gem install ${gem_name} ${extra_args[*]}"
+    sudo -u liquidsoap bash -c "
+      export GEM_HOME=${GEMS_HOME}
+      export GEM_PATH=${GEMS_HOME}:/opt/jruby/lib/ruby/gems/shared
+      ${GEM_BIN} install ${gem_name} ${extra_args[*]} --no-document
+    " || echo "  WARNING: failed to install ${gem_name}"
+  }
+
+  # Core persistence
+  install_gem "sequel"
+  install_gem "jdbc-sqlite3"
+
+  # XML parsing. Pure-Java build under JRuby (--platform java) bundles
+  # Xerces/NekoHTML/Xalan as JARs; no libxml2-dev or compiler required.
+  install_gem "nokogiri" "--platform" "java"
+
+  # Convenience JSON (usually stdlib, but ensure availability)
+  install_gem "json"
+
+  echo "JRUBY DEPENDENCIES COMPLETE"
+else
+  echo
+  echo "WARNING: ${JRUBY_BIN} not found; skipping JRuby gem installation."
+  echo "         Install JRuby manually, then re-run this installer or run:"
+  echo "           sudo -u liquidsoap ${GEM_BIN} install sequel jdbc-sqlite3 json"
+  echo "           sudo -u liquidsoap ${GEM_BIN} install nokogiri --platform java"
 fi
-echo "==> Installing Python dependencies (feedparser, requests) ..."
-"${VENV}/bin/pip" install --quiet --upgrade pip
-"${VENV}/bin/pip" install --quiet feedparser requests
-
-# Make sure the liquidsoap user can traverse the install dir and use the venv.
-chmod o+x "$INSTALL_DIR"
-chown -R "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "$VENV"
 
 # ---------------------------------------------------------------------------
-# 7. systemd unit (named after the directory)
+# Self-locating launcher (sets GEM_HOME/GEM_PATH before JRuby boots)
 # ---------------------------------------------------------------------------
-echo "==> Writing systemd unit ${UNIT_FILE} ..."
-cat > "$UNIT_FILE" <<EOF
+LAUNCHER="${SCRIPT_DIR}/run_radio.sh"
+cat > "$LAUNCHER" <<'LAUNCH_EOF'
+#!/usr/bin/env bash
+# run_radio.sh - self-locating JRuby launcher for the radio automation scripts.
+# Exports GEM_HOME/GEM_PATH BEFORE jruby boots, because mutating them inside a
+# running JRuby process does not reliably affect gem resolution (JRuby #5269).
+#
+# Usage: ./run_radio.sh <script.rb> [args...]
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEMS_HOME="${SELF_DIR}/.gems"
+JRUBY_HOME="/opt/jruby"
+
+export GEM_HOME="${GEMS_HOME}"
+export GEM_PATH="${GEMS_HOME}:${JRUBY_HOME}/lib/ruby/gems/shared"
+
+exec "${JRUBY_HOME}/bin/jruby" "${SELF_DIR}/$@"
+LAUNCH_EOF
+chmod +x "$LAUNCHER"
+chown liquidsoap:liquidsoap "$LAUNCHER"
+echo "Wrote ${LAUNCHER}"
+
+# Make the Ruby scripts executable
+for rb in "${SCRIPT_DIR}"/*.rb; do
+  [[ -f "$rb" ]] && chmod +x "$rb" && chown liquidsoap:liquidsoap "$rb"
+done
+
+# ---------------------------------------------------------------------------
+# Crontab entries (installed into liquidsoap's crontab, not root's)
+# ---------------------------------------------------------------------------
+CRON_FETCH="*/30 * * * * cd ${SCRIPT_DIR} && ./run_radio.sh fetch_podcasts.rb >> ${STORAGE}/logs/cron_fetch.log 2>&1"
+CRON_UPDATE="15 * * * * cd ${SCRIPT_DIR} && ./run_radio.sh update_playlists.rb >> ${STORAGE}/logs/cron_update.log 2>&1"
+
+echo
+echo "Installing crontab entries for user 'liquidsoap'..."
+( crontab -l -u liquidsoap 2>/dev/null || true ) | grep -vF "run_radio.sh" | \
+  { cat; echo "$CRON_FETCH"; echo "$CRON_UPDATE"; } | crontab -u liquidsoap -
+echo "Crontab updated."
+
+# ---------------------------------------------------------------------------
+# Optional systemd service
+# ---------------------------------------------------------------------------
+ENABLE_SERVICE=""
+until [[ "$ENABLE_SERVICE" =~ ^[YyNn]$ ]]; do
+  read -rp "Enable ${SERVICE_NAME} systemd service now? [y/N]: " ENABLE_SERVICE
+done
+
+if [[ "$ENABLE_SERVICE" =~ ^[Yy]$ ]]; then
+  echo
+  echo "Writing ${SYSTEMD_UNIT} ..."
+  cat > "$SYSTEMD_UNIT" <<UNIT_EOF
 [Unit]
-Description=Radio automation (${SERVICE_NAME}) - liquidsoap
+Description=${SERVICE_NAME} radio automation (liquidsoap)
 After=network-online.target icecast2.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=${LIQUIDSOAP_USER}
-WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/station_runner.py
+User=liquidsoap
+WorkingDirectory=${SCRIPT_DIR}
+ExecStart=${SCRIPT_DIR}/station.liq
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT_EOF
 
-# Minimal runner that execs liquidsoap on station.liq from the install dir.
-cat > "${INSTALL_DIR}/station_runner.py" <<'PYRUN'
-import os, subprocess, sys
-install_dir = os.path.dirname(os.path.abspath(__file__))
-os.chdir(install_dir)
-sys.exit(subprocess.call(["liquidsoap", os.path.join(install_dir, "station.liq")]))
-PYRUN
-chown "$LIQUIDSOAP_USER":"$LIQUIDSOAP_USER" "${INSTALL_DIR}/station_runner.py"
-
-systemctl daemon-reload
+  systemctl daemon-reload
+  systemctl enable --now "${SERVICE_NAME}"
+  echo "Service ${SERVICE_NAME} enabled and started."
+else
+  echo "Skipping systemd service (you can enable it later with:"
+  echo "  sudo cp ${SCRIPT_DIR}/${SERVICE_NAME}.service /etc/systemd/system/ && sudo systemctl enable --now ${SERVICE_NAME})"
+fi
 
 # ---------------------------------------------------------------------------
-# 8. Cron jobs — installed into the liquidsoap user's crontab so all
-#    database/media writes happen under the same identity as the service.
+# Summary
 # ---------------------------------------------------------------------------
-echo "==> Setting up cron jobs under user '${LIQUIDSOAP_USER}' ..."
-FETCH_CRON="0 * * * * cd ${INSTALL_DIR} && ./.venv/bin/python fetch_podcasts.py >> ${STORAGE_PATH}/logs/fetch.log 2>&1"
-UPDATE_CRON="30 * * * * cd ${INSTALL_DIR} && ./.venv/bin/python update_playlists.py >> ${STORAGE_PATH}/logs/update.log 2>&1"
-
-# Remove any stale entries from the liquidsoap user's crontab, then add ours.
-sudo -u "$LIQUIDSOAP_USER" crontab -l 2>/dev/null | grep -vF "fetch_podcasts.py" | grep -vF "update_playlists.py" > /tmp/cron_ls_py.$$ || true
-echo "$FETCH_CRON"  >> /tmp/cron_ls_py.$$
-echo "$UPDATE_CRON" >> /tmp/cron_ls_py.$$
-sudo -u "$LIQUIDSOAP_USER" crontab /tmp/cron_ls_py.$$
-rm -f /tmp/cron_ls_py.$$
-
-# Also scrub these from root's crontab in case an earlier install put them there.
-crontab -l 2>/dev/null | grep -vF "fetch_podcasts.py" | grep -vF "update_playlists.py" > /tmp/cron_root_py.$$ || true
-crontab /tmp/cron_root_py.$$
-rm -f /tmp/cron_root_py.$$
-
-# ---------------------------------------------------------------------------
-# 9. Enable services
-# ---------------------------------------------------------------------------
-systemctl enable icecast2 "$SERVICE_NAME"
-echo "==> Enabling icecast2 and ${SERVICE_NAME} at boot."
-
-echo ""
-echo "============================================================"
+echo
+echo "=============================================="
 echo " Installation complete."
-echo ""
-echo " Next steps:"
-echo "   1. Drop background music into ${STORAGE_PATH}/music/"
-echo "   2. Edit ${INSTALL_DIR}/schedule.txt for scheduled shows"
-echo "   3. Review ${INSTALL_DIR}/station.liq"
-echo "   4. Start: systemctl start icecast2 ${SERVICE_NAME}"
-echo "============================================================"
+echo "----------------------------------------------"
+echo " Storage:      ${STORAGE}"
+echo " Config:       ${CONFIG_FILE}"
+echo " Launcher:     ${LAUNCHER}"
+echo " Service:      ${SERVICE_NAME}"
+echo "----------------------------------------------"
+echo " Quick start:"
+echo "   cd ${SCRIPT_DIR}"
+echo "   sudo -u liquidsoap ./run_radio.sh fetch_podcasts.rb --list-shows"
+echo "   sudo -u liquidsoap ./run_radio.sh fetch_podcasts.rb --add-show <rss-url>"
+echo "   sudo -u liquidsoap ./run_radio.sh update_playlists.rb"
+echo "=============================================="
