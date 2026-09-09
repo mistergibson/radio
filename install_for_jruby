@@ -55,7 +55,35 @@ rm -f "${STORAGE_ROOT}/state/subscriptions.db" \
       "${STORAGE_ROOT}/state/subscriptions.db-shm" \
       "${STORAGE_ROOT}/state/played.db-wal" \
       "${STORAGE_ROOT}/state/played.db-shm"
-echo "==> Databases dropped (will be recreated by scripts on first run)"
+echo "==> Databases dropped (will be recreated now)"
+# Initialize database schemas
+sqlite3 "${STORAGE_ROOT}/state/subscriptions.db" <<'SQL'
+CREATE TABLE IF NOT EXISTS shows (
+    guid TEXT PRIMARY KEY,
+    slug TEXT UNIQUE NOT NULL,
+    title TEXT,
+    feed_url TEXT UNIQUE NOT NULL,
+    archive INTEGER DEFAULT 0,
+    opml_import INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+SQL
+
+sqlite3 "${STORAGE_ROOT}/state/played.db" <<'SQL'
+CREATE TABLE IF NOT EXISTS episodes (
+    guid TEXT PRIMARY KEY,
+    show_guid TEXT NOT NULL REFERENCES shows(guid),
+    title TEXT,
+    url TEXT,
+    duration_seconds INTEGER,
+    played INTEGER DEFAULT 0,
+    local_path TEXT,
+    file_size_bytes INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+SQL
+
+echo "Database schemas initialized."
 
 # --- Install gems one at a time ---------------------------------------------
 export GEM_HOME="${GEMS_DIR}"
@@ -155,6 +183,11 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 echo "==> Installed ${UNIT_PATH}"
+# After the mkdir -p "$STORAGE/state" line, add:
+mkdir -p "$STORAGE/state"
+chown -R liquidsoap:liquidsoap "$STORAGE/state"
+chmod 755 "$STORAGE/state"
+chmod 664 "$STORAGE/state/"*.db 2>/dev/null || true
 
 # --- Cron entries (liquidsoap user's crontab already exists from package) -----
 CRON_FETCH="0 * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh fetch_podcasts.rb --fetch-all >> ${STORAGE_ROOT}/logs/fetch_cron.log 2>&1"
