@@ -207,41 +207,48 @@ def parse_feed(opts)
   }
 end
 
-def register_show(show_title, feed_url, archive_flag = 0, opml_flag = 0)
-  url = feed_url.to_s.strip
-  return false if url.empty?
+def register_show(show_title, feed_url, archive: false, opml_import: false)
+  title = show_title.to_s.strip
+  url   = feed_url.to_s.strip
+  return nil if title.empty? || url.empty?
 
-  existing = $db_s[:shows].where(feed_url: url).first
-  if existing
-    # Update archive/opml flags if they changed
-    if existing[:archive] != archive_flag || existing[:opml_import] != opml_flag
-      $db_s[:shows].where(guid: existing[:guid]).update(
-        archive: archive_flag,
-        opml_import: opml_flag
-      )
-      log("DEBUG", "Updated flags for #{existing[:slug]}: archive=#{archive_flag}, opml=#{opml_flag}")
-    end
-    return existing
+  slug = title.downcase.gsub(/[^a-z0-9]+/, "_").gsub(/^_+|_+$/, "")
+  slug = "show" if slug.empty?
+
+  # Check for slug collision with a different feed URL
+  existing_slug = $db_s[:shows].where(slug: slug).first
+  if existing_slug && existing_slug[:feed_url] != url
+    # Append a short hash of the URL to disambiguate
+    suffix = Digest::SHA1.hexdigest(url)[0, 6]
+    slug = "#{slug}_#{suffix}"
   end
 
-  title = show_title.to_s.strip
-  slug = generate_slug(title)
-  slug = "show_#{Digest::SHA1.hexdigest(url)[0,8]}" if slug.empty?
-
   guid = gen_guid(url)
-  now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
+  now  = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
 
-  $db_s[:shows].insert(
-    guid: guid,
-    slug: slug,
-    title: title,
-    feed_url: url,
-    archive: archive_flag,
-    opml_import: opml_flag,
-    created_at: now
-  )
-  log("INFO", "Registered show: #{slug} (#{title})")
-  $db_s[:shows].where(guid: guid).first
+  existing = $db_s[:shows].where(guid: guid).first
+  if existing
+    $db_s[:shows].where(guid: guid).update(
+      title: title,
+      slug: slug,
+      feed_url: url,
+      archive: archive ? 1 : 0,
+      opml_import: opml_import ? 1 : 0
+    )
+  else
+    $db_s[:shows].insert(
+      guid: guid,
+      slug: slug,
+      title: title,
+      feed_url: url,
+      archive: archive ? 1 : 0,
+      opml_import: opml_import ? 1 : 0,
+      created_at: now
+    )
+  end
+
+  log("INFO", "Registered: #{title} (#{slug})")
+  true
 end
 
 def sync_gpodder

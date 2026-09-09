@@ -184,10 +184,10 @@ EOF
 systemctl daemon-reload
 echo "==> Installed ${UNIT_PATH}"
 # After the mkdir -p "$STORAGE/state" line, add:
-mkdir -p "$STORAGE/state"
-chown -R liquidsoap:liquidsoap "$STORAGE/state"
-chmod 755 "$STORAGE/state"
-chmod 664 "$STORAGE/state/"*.db 2>/dev/null || true
+mkdir -p "$STORAGE_ROOT/state"
+chown -R liquidsoap:liquidsoap "$STORAGE_ROOT/state"
+chmod 755 "$STORAGE_ROOT/state"
+chmod 664 "$STORAGE_ROOT/state/"*.db 2>/dev/null || true
 
 # --- Cron entries (liquidsoap user's crontab already exists from package) -----
 CRON_FETCH="0 * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh fetch_podcasts.rb --fetch-all >> ${STORAGE_ROOT}/logs/fetch_cron.log 2>&1"
