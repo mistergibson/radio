@@ -186,6 +186,7 @@ echo "==> Installed ${UNIT_PATH}"
 # After the mkdir -p "$STORAGE/state" line, add:
 mkdir -p "$STORAGE_ROOT/state"
 chown -R liquidsoap:liquidsoap "$STORAGE_ROOT/state"
+chown -R liquidsoap:liquidsoap "$INSTALL_DIR"
 chmod 755 "$STORAGE_ROOT/state"
 chmod 664 "$STORAGE_ROOT/state/"*.db 2>/dev/null || true
 
