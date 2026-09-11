@@ -1,4 +1,4 @@
-#!/usr/bin/env jruby
+!#/usr/bin/env jruby
 # frozen_string_literal: true
 
 require "net/http"
@@ -7,7 +7,9 @@ require "json"
 require "digest/sha1"
 require "sequel"
 require "nokogiri"
-
+unless defined?(Nokogiri::XML)
+  raise Exception.new "Nokogiri did NOT load"
+end
 SCRIPT_DIR  = File.expand_path(File.dirname(__FILE__))
 CONFIG_PATH = File.join(SCRIPT_DIR, "config.json")
 
@@ -137,14 +139,15 @@ def http_stream_to_file(url, dest_path, user = nil, pass = nil)
     unless res.is_a?(Net::HTTPSuccess)
       raise "HTTP #{res.code}: #{res.message}"
     end
-
+    buffer = ::StringIO.new (res.read_body)
+    buffer.rewind
     File.open(tmp_dest, "wb") do |f|
-      res.read_body { |chunk| f.write(chunk) }
+      buffer.read() { |chunk| f.write(chunk) }
     end
     File.rename(tmp_dest, dest_path)
     success = true
   rescue Exception => error
-    log("ERROR", "Download failed for #{url}: #{error.class}: #{error.message}")
+    log("ERROR", "Download failed for #{url}: #{error.class}: #{error.message}, Backtrace --> #{error.backtrace}")
     begin
       File.delete(tmp_dest) if File.exist?(tmp_dest)
     rescue StandardError
@@ -158,7 +161,7 @@ def parse_feed(opts)
   file_path = opts[:file_path] || raise("parse_feed: :file_path is required")
   feed_url  = opts[:feed_url]  || ""
 
-  doc = Nokogiri::XML(File.read(file_path), nil, XML::NO_NETWORK)
+  doc = Nokogiri::XML(File.read(file_path), nil)
   channel = doc.at_xpath("//channel")
   raise "No <channel> element found in feed" unless channel
 
@@ -245,7 +248,7 @@ def register_show(show_title, feed_url, archive: false, opml_import: false)
       opml_import: opml_import ? 1 : 0,
       created_at: now
     )
-  end
+ end
 
   log("INFO", "Registered: #{title} (#{slug})")
   true
