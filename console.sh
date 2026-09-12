@@ -14,9 +14,9 @@ export GEM_PATH="${GEMS_DIR}"
 #
 if [ -e "${JIRB_BIN}" ]; then
   if [ -e "${SCRIPT_DIR}/${FILE_TO_LOAD}" ]; then
-    exec env JAVA_OPTS="${JAVA_OPTS}" JRUBY_OPTIONS="${JRUBY_OPTIONS}" "${JIRB_BIN}" -r "${SCRIPT_DIR}/${FILE_TO_LOAD}"
+    exec env JAVA_OPTS="${JAVA_OPTS}" JRUBY_OPTIONS="${JRUBY_OPTIONS}" "/usr/bin/sudo" -u liquidsoap "${JIRB_BIN}" -r "${SCRIPT_DIR}/${FILE_TO_LOAD}"
   else
-    exec env JAVA_OPTS="${JAVA_OPTS}" JRUBY_OPTIONS="${JRUBY_OPTIONS}" "${JIRB_BIN}"
+    exec env JAVA_OPTS="${JAVA_OPTS}" JRUBY_OPTIONS="${JRUBY_OPTIONS}" "/usr/bin/sudo -u liquidsoap ${JIRB_BIN}"
   fi
   exit 0
 else
