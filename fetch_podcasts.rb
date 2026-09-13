@@ -1,6 +1,6 @@
 !#/usr/bin/env jruby
 # frozen_string_literal: true
-
+require "rubygems"
 require "net/http"
 require "uri"
 require "json"
