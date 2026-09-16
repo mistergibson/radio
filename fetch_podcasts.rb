@@ -158,56 +158,59 @@ def http_stream_to_file(url, dest_path, user = nil, pass = nil)
 end
 
 def parse_feed(opts)
+  result = nil
   file_path = opts[:file_path] || raise("parse_feed: :file_path is required")
   feed_url  = opts[:feed_url]  || ""
 
   doc = Nokogiri::XML(File.read(file_path), nil)
   channel = doc.at_xpath("//channel")
-  raise "No <channel> element found in feed" unless channel
+  if channel
+    items = []
+    channel.elements("item").each do |item|
+      enc = item.at_xpath("./enclosure")
+      next unless enc
+      next unless enc.attributes["type"].value =~ /audio/i
 
-  items = []
-  channel.elements("item").each do |item|
-    enc = item.at_xpath("./enclosure")
-    next unless enc
-    next unless enc.attributes["type"].value =~ /audio/i
-
-    pub_date_raw = item.at_xpath("./pubDate")&.text
-    published_at = begin
-      Time.parse(pub_date_raw)&.utc&.strftime("%Y-%m-%d %H:%M:%S")
-    rescue StandardError
-      nil
-    end
-
-    dur_el = item.at_xpath(".//media:duration", "media" => "http://search.yahoo.com/mrss/")
-    dur_sec = 0
-    if dur_el
-      d = dur_el.text.strip
-      if d.include?(":")
-        parts = d.split(":").map(&:to_i)
-        dur_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
-      else
-        dur_sec = d.to_i
+      pub_date_raw = item.at_xpath("./pubDate")&.text
+      published_at = begin
+        Time.parse(pub_date_raw)&.utc&.strftime("%Y-%m-%d %H:%M:%S")
+      rescue StandardError
+        nil
       end
+
+      dur_el = item.at_xpath(".//media:duration", "media" => "http://search.yahoo.com/mrss/")
+      dur_sec = 0
+      if dur_el
+        d = dur_el.text.strip
+        if d.include?(":")
+          parts = d.split(":").map(&:to_i)
+          dur_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+        else
+          dur_sec = d.to_i
+        end
+      end
+
+      enc_len = enc.attributes["length"]&.value&.to_i || 0
+      est_dur = (enc_len / (128 * 1024)).round if enc_len > 0
+
+      items << {
+        guid: item.at_xpath("./guid")&.text.presence || gen_guid(enc.attributes["url"].value),
+        title: item.at_xpath("./title")&.text || "Untitled",
+        url: enc.attributes["url"].value,
+        duration_seconds: dur_sec > 0 ? dur_sec : (est_dur || 0),
+        file_size_bytes: enc_len,
+        published_at: published_at
+      }
     end
-
-    enc_len = enc.attributes["length"]&.value&.to_i || 0
-    est_dur = (enc_len / (128 * 1024)).round if enc_len > 0
-
-    items << {
-      guid: item.at_xpath("./guid")&.text.presence || gen_guid(enc.attributes["url"].value),
-      title: item.at_xpath("./title")&.text || "Untitled",
-      url: enc.attributes["url"].value,
-      duration_seconds: dur_sec > 0 ? dur_sec : (est_dur || 0),
-      file_size_bytes: enc_len,
-      published_at: published_at
+    result = {
+      title: channel.at_xpath("./title")&.text || "Unknown Show",
+      feed_url: feed_url,
+      items: items
     }
+  else
+    # log - skipping - no channel data
   end
-
-  {
-    title: channel.at_xpath("./title")&.text || "Unknown Show",
-    feed_url: feed_url,
-    items: items
-  }
+  result
 end
 
 def register_show(show_title, feed_url, archive: false, opml_import: false)
@@ -389,7 +392,7 @@ def cmd_import_opml(path)
       next
     end
 
-    slug = gen_guid(url)[0..11]
+    slug = generate_slug(title)
     guid = gen_guid(url)
     $db_s[:shows].insert(
       guid: guid,
