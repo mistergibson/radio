@@ -6,3 +6,19 @@
 # Examples:
 # 0 8 * * 2     show    hardcore_history
 # 0 6 * * 1     stream  http://example.org:8000/live.mp3   3600
+# ################################################################### Daily
+# KOPB --> BBC News & Local (Midnight to 7am)
+0 0 * * 1-7	stream	http://stream1.opb.org/radio.mp3	25200
+# History of Rome (Noon to 1pm)
+0 12 * * 1-7	show	the_history_of_rome
+# ################################################################### Weekdays
+# UpFront KPFA
+0 7 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+# Bradcast
+0 8 * * 1-5	show	the_bradcast_w_brad_friedman
+# Hardknock Radio KPFA
+0 16 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+# Flashpoints KPFA
+0 17 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+# Evening News KPFA
+0 18 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600

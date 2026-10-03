@@ -1,85 +1,63 @@
-#!/usr/bin/env liquidsoap
+# station.liq - Cascadia Digital Collective Radio Automation
+# Liquidsoap 2.2.4-1+dev compatible
+# Run from /srv/radio so relative paths resolve correctly
 
-# ---------------------------------------------------------------
-# station.liq - Liquidsoap configuration for radio automation
-# Written for Liquidsoap 2.2.x. Run from /srv/radio so that the
-# relative config.json path resolves correctly; media lives under
-# the storage path read from that file. Directory playlists scan
-# recursively for audio files automatically.
-#
-# JINGLE/ANNOUNCEMENT NOTE:
-# random() stalls when one branch is permanently down (empty dir).
-# Until jingles/announcements directories contain audio files,
-# they are excluded from the graph. Uncomment the relevant lines
-# below once you've added content to those folders.
-# ---------------------------------------------------------------
+settings.log.file.set(false)
 
-set("log.stdout", true)
-set("log.level", 3)
+# --- Load config ---
+# Explicit type annotation required: without it, fields used only in #{...}
+# interpolations default to null (see liquidsoap json docs).
+let json.parse ({ storage, icecast = { host, port, mount, source_username, source_password } }
+                : { storage: string,
+                    icecast: { host: string, port: int, mount: string,
+                               source_username: string, source_password: string } })
+  = file.contents("config.json")
 
-# --- Step 1: path to config.json (relative to working directory) ---
-let config_path = "config.json"
+storage_base = storage
+music_dir = "#{storage}/music"
+queue_dir = "#{storage}/queues"
 
-# --- Step 2: read and parse the whole file with explicit types --
-let json.parse (cfg : {
-  storage: string,
-  icecast: {
-    host: string,
-    port: int,
-    mount: string,
-    username: string,
-    password: string
-  }
-}) = file.contents(config_path)
+icecast_host = host
+icecast_port = port
+icecast_mount = mount
+icecast_user = source_username
+icecast_pass = source_password
 
-# --- Step 3: pull out the values we need ------------------------
-let storage     = cfg.storage
-let ic_host     = cfg.icecast.host
-let ic_port     = cfg.icecast.port
-let ic_mount    = cfg.icecast.mount
-let ic_username = cfg.icecast.username
-let ic_password = cfg.icecast.password
+print("Config loaded: storage=#{storage_base}, icecast=#{icecast_host}:#{icecast_port}#{icecast_mount}")
 
-set("log.file.path", "#{storage}/logs/liquidsoap.log")
+# --- Background music playlist (loops forever by default) ---
+background_music = playlist(music_dir)
 
-# --- Background music library (directory scanned recursively) --
-music_playlist =
-  mksafe(playlist("#{storage}/music"))
+# --- Show queue source (reads current_queue.txt each tick) ---
+# In 2.2.x the callback must return a request (type ()->request), not null.
+# When the queue is empty we play a short synthesized tone so the source
+# stays up without needing an external file.
+def read_queue()
+  qf = "#{queue_dir}/current_queue.txt"
+  if file.exists(qf) and file.contents(qf) != "" then
+    request.create(file.contents(qf))
+  else
+    request.create("synth:shape=sine,frequency=440.,duration=1.")
+  end
+end
 
-# --- Scheduled content: request queue fed by schedule.txt ------
-sched_queue = request.queue(id="scheduler")
+show_source = request.dynamic(prefetch=1, read_queue)
 
-# --- Jingles / announcements (uncomment when dirs have content) ---
-# jingles_src =
-#   mksafe(playlist("#{storage}/jingles"))
-#
-# announcements_src =
-#   mksafe(playlist("#{storage}/announcements"))
+# --- Mux: show takes priority, fall back to background music ---
+main_out = mksafe(fallback([show_source, background_music]))
 
-# --- Assemble the stream ---------------------------------------
-primary = fallback(track_sensitive=false, [sched_queue, music_playlist])
-
-# When jingles are active, uncomment this and comment out the line below:
-# content = random(weights=[1, 8], [jingles_src, primary])
-content = primary
-
-# When announcements are active, uncomment this and comment out the line below:
-# final_content = fallback(track_sensitive=false, [announcements_src, content])
-final_content = content
-
-radio = normalize(final_content)
-
-# --- Output to Icecast -----------------------------------------
+# --- Output to Icecast ---
 output.icecast(
-  %mp3(bitrate=128, samplerate=44100, stereo=true),
-  host=ic_host,
-  port=ic_port,
-  user=ic_username,
-  password=ic_password,
-  mount=ic_mount,
-  name="Radio Station",
-  description="Automated internet radio",
-  genre="Various",
+  %mp3(bitrate=128),
+  host=icecast_host,
+  port=icecast_port,
+  user=icecast_user,
+  password=icecast_pass,
+  mount=icecast_mount,
+  name="Road Unit Radio",
+  description="Community radio automation",
+  genre="various",
+  url="",
   public=true,
-  radio
+  main_out
 )
