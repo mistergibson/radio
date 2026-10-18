@@ -1,4 +1,7 @@
 [![Hippocratic License HL3-FULL](https://img.shields.io/static/v1?label=Hippocratic%20License&message=HL3-FULL&labelColor=5e2751&color=bc8c3d)](https://firstdonoharm.dev/version/3/0/full.html)
+
+Please consider supporting development here: https://ko-fi.com/mistergibson
+
 # JRuby Radio Automation
 
 Self-hosted internet radio automation: **JRuby** scripts drive a **Liquidsoap 2.2.4** stream into **Icecast**, on a schedule written in cron syntax. One script talks to podcast feeds and SQLite, one script is the clock, one Liquidsoap config plays what the clock queues. The Python implementation that used to live alongside this one has been removed; this stack is JRuby-only.
