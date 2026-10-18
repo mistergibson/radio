@@ -49,6 +49,13 @@ $db_s.execute("PRAGMA busy_timeout=5000;")
 $db_p.execute("PRAGMA journal_mode=WAL;")
 $db_p.execute("PRAGMA busy_timeout=5000;")
 
+# JRuby/Sequel quirk: the JDBC connection binds lazily, and datasets built on
+# $db_p can resolve against the wrong database file ("no such table: main.shows"
+# when inserting episodes). Force each connection to bind to its own file now,
+# while we still have an explicit handle to verify it.
+$db_s.from(:shows).count
+$db_p.from(:episodes).count
+
 def log(level, msg)
   ts = Time.now.strftime("%Y-%m-%d %H:%M:%S")
   line = "[#{ts}] [#{level}] #{msg}"
@@ -139,11 +146,10 @@ def http_stream_to_file(url, dest_path, user = nil, pass = nil)
     unless res.is_a?(Net::HTTPSuccess)
       raise "HTTP #{res.code}: #{res.message}"
     end
-    buffer = ::StringIO.new (res.read_body)
-    buffer.rewind
-    File.open(tmp_dest, "wb") do |f|
-      buffer.read() { |chunk| f.write(chunk) }
-    end
+    body = res.read_body
+    # JRuby bug: StringIO#read with a block does not reliably yield chunks,
+    # resulting in a 0-byte file. Write the body directly instead.
+    File.open(tmp_dest, "wb") { |f| f.write(body) }
     File.rename(tmp_dest, dest_path)
     success = true
   rescue Exception => error
@@ -166,7 +172,9 @@ def parse_feed(opts)
   channel = doc.at_xpath("//channel")
   if channel
     items = []
-    channel.elements("item").each do |item|
+    # JRuby bug: node.elements("tagname") raises ArgumentError under JRuby/Nokogiri.
+    # XPath is the verified-working form (the raw-feed probe used it successfully).
+    channel.xpath("./item").each do |item|
       enc = item.at_xpath("./enclosure")
       next unless enc
       next unless enc.attributes["type"].value =~ /audio/i
@@ -194,7 +202,11 @@ def parse_feed(opts)
       est_dur = (enc_len / (128 * 1024)).round if enc_len > 0
 
       items << {
-        guid: item.at_xpath("./guid")&.text.presence || gen_guid(enc.attributes["url"].value),
+        # JRuby has no ActiveSupport; String#presence is unavailable. Use strip + empty? check.
+        guid: begin
+          g = item.at_xpath("./guid")&.text.to_s.strip
+          g.empty? ? nil : g
+        end || gen_guid(enc.attributes["url"].value),
         title: item.at_xpath("./title")&.text || "Untitled",
         url: enc.attributes["url"].value,
         duration_seconds: dur_sec > 0 ? dur_sec : (est_dur || 0),
@@ -453,36 +465,49 @@ def cmd_fetch_all
 
     next unless parsed
 
-    show_dir = File.join(PODCAST_DIR, show[:slug])
-    ensure_dir(show_dir)
-
+    # Option A: record URL-only episode rows; do NOT pre-download full MP3s.
+    # The old code called http_stream_to_file(ep[:url], dest) for every item
+    # before inserting the row. For BradCast (3028 eps x ~55 MB ~= 167 GB) that
+    # hung/filled disk on the first pull, so zero rows ever landed and
+    # resolve_show had nothing to queue. We now insert immediately with url set
+    # and local_path NULL; liquidsoap streams the remote URL at air time
+    # (resolve_show already falls back to ep[:url] when local_path is absent).
     new_eps = 0
+    skipped_existing = 0
     parsed[:items].each do |ep|
+      # Dedup by guid: skip anything we've already recorded for this feed.
       existing = $db_p[:episodes].where(guid: ep[:guid]).first
       if existing
+        skipped_existing += 1
         next
       end
 
-      filename = "#{ep[:guid]}.mp3"
-      dest = File.join(show_dir, filename)
-      dl_ok = http_stream_to_file(ep[:url], dest)
-      size = dl_ok ? File.size(dest) : 0
+      # Defensive: require a non-empty playback target. parse_feed only yields
+      # audio enclosures, but guard against a malformed item anyway.
+      url = ep[:url].to_s.strip
+      next if url.empty?
 
       now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
-      $db_p[:episodes].insert(
-        guid: ep[:guid],
-        show_guid: show[:guid],
-        title: ep[:title],
-        url: ep[:url],
-        duration_seconds: ep[:duration_seconds],
-        played: 0,
-        local_path: dest,
-        file_size_bytes: size,
-        created_at: now
-      )
-      new_eps += 1
+      begin
+        $db_p[:episodes].insert(
+          guid: ep[:guid],
+          show_guid: show[:guid],
+          title: ep[:title],
+          url: url,
+          duration_seconds: ep[:duration_seconds] || 0,
+          played: 0,
+          local_path: nil,            # Option A: stream remotely; no local file
+          file_size_bytes: ep[:file_size_bytes] || 0,
+          created_at: now
+        )
+        new_eps += 1
+      rescue StandardError => e
+        # Log per-item failures instead of letting one bad row abort the whole
+        # show (and silently lose every remaining episode).
+        log("WARN", "Insert failed for #{show[:slug]} ep #{ep[:guid]}: #{e.message}")
+      end
     end
-    log("INFO", "#{show[:slug]}: #{new_eps} new episodes downloaded")
+    log("INFO", "#{show[:slug]}: #{new_eps} new episodes recorded (#{skipped_existing} already known)")
   end
 end
 

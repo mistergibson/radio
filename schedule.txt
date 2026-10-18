@@ -22,3 +22,6 @@
 0 17 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
 # Evening News KPFA
 0 18 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+# test
+# 50 15 * * 1-7 stream https://streams.kpfa.org:8443/kpfa 3600
+

@@ -193,14 +193,17 @@ chmod 664 "$STORAGE_ROOT/state/"*.db 2>/dev/null || true
 # --- Cron entries (liquidsoap user's crontab already exists from package) -----
 CRON_FETCH="0 * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh fetch_podcasts.rb --fetch-all >> ${STORAGE_ROOT}/logs/fetch_cron.log 2>&1"
 CRON_UPDATE="30 * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh update_playlists.rb >> ${STORAGE_ROOT}/logs/update_cron.log 2>&1"
-
+CRON_SCHED="* * * * * cd ${INSTALL_DIR} && ${INSTALL_DIR}/run_radio.sh scheduler.rb >> ${STORAGE_ROOT}/logs/scheduler_cron.log 2>&1"
 CURRENT_CRONTAB=$(crontab -u liquidsoap -l 2>/dev/null || true)
 NEW_CRONTAB="${CURRENT_CRONTAB}"
 if ! echo "${NEW_CRONTAB}" | grep -qF "fetch_podcasts.rb --fetch-all"; then
     NEW_CRONTAB="${NEW_CRONTAB}${NEW_CRONTAB:+$'\n'}${CRON_FETCH}"
 fi
-if ! echo "${NEW_CRONTAB}" | grep -qF "update_playlist.rb"; then
+if ! echo "${NEW_CRONTAB}" | grep -qF "update_playlists.rb"; then
     NEW_CRONTAB="${NEW_CRONTAB}${NEW_CRONTAB:+$'\n'}${CRON_UPDATE}"
+fi
+if ! echo "${NEW_CRONTAB}" | grep -qF "scheduler.rb"; then
+    NEW_CRONTAB="${NEW_CRONTAB}${NEW_CRONTAB:+$'\n'}${CRON_SCHED}"
 fi
 echo "${NEW_CRONTAB}" | crontab -u liquidsoap -
 echo "==> Cron entries installed for user liquidsoap"

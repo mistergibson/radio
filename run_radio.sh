@@ -25,6 +25,9 @@ JRUBY_BIN="/usr/bin/jruby"
 export GEM_HOME="${GEMS_DIR}"
 export GEM_PATH="${GEMS_DIR}"
 
+RADIO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export RADIO_DIR
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: $(basename "$0") <script.rb> [args...]" >&2
   exit 1
