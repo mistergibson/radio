@@ -1,4 +1,4 @@
-# Radio Schedule
+## Radio Schedule
 # Format: min hour dom mon dow TYPE TARGET [RUNLENGTH_SECONDS]
 # TYPE: show | stream
 # RUNLENGTH required for stream entries, ignored for show entries
@@ -8,20 +8,109 @@
 # 0 6 * * 1     stream  http://example.org:8000/live.mp3   3600
 # ################################################################### Daily
 # KOPB --> BBC News & Local (Midnight to 7am)
-0 0 * * 1-7	stream	http://stream1.opb.org/radio.mp3	25200
+0 0 * * 1-7    stream    http://stream1.opb.org/radio.mp3    25200
 # History of Rome (Noon to 1pm)
-0 12 * * 1-7	show	the_history_of_rome
+0 12 * * 1-7    show    the_history_of_rome
 # ################################################################### Weekdays
+# ############################################################# Morning
 # UpFront KPFA
-0 7 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+0 7 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
 # Bradcast
-0 8 * * 1-5	show	the_bradcast_w_brad_friedman
+0 8 * * 1-5    show    the_bradcast_w_brad_friedman
+# Extinction Rebellion
+0 9 * * 1-5    show    extinction_rebellion_podcast
+15 9 * * 1-5	show	conservation_news	
+30 9 * * 1-5	show	conservation_news
+45 9 * * 1-5	show	conservation_news
+# Jacobin Radio (Two Hours)
+0 10 * * 1-5    show    jacobin_radio
+# CrazyTown
+0 11 * * 1-5    show    crazy_town
+# ############################################################# Afternoon
+# Linux Shows
+0 13 * * 1-5    show    late_night_linux_all_episodes
+30 13 * * 1-5    show   destination_linux
+# Live Like the World is Dying:
+0 14 * * 1-5    show    the_appeal
+# Revolutions
+0 15 * * 1-5    show    revolutions
 # Hardknock Radio KPFA
-0 16 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+0 16 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
 # Flashpoints KPFA
-0 17 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
+0 17 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
 # Evening News KPFA
-0 18 * * 1-5	stream	https://streams.kpfa.org:8443/kpfa	3600
-# test
-# 50 15 * * 1-7 stream https://streams.kpfa.org:8443/kpfa 3600
-
+0 18 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
+# ############################################################# Evening
+# Alternative Visions
+0 19 * * 1-5    show    alternative_visions
+# EFF's Effector
+0 20 * * 1-5    show    effector
+# Energy Transition Show
+0 21 * * 1-5    show    the_energy_transition_show_with_chris_nelder
+# The Green Element
+0 22 * * 1-5    show    sustainability_solved
+# History of Philosophy (Without any gaps)
+0 23 * * 1-5    show    history_of_philosophy_without_any_gaps
+# ################################################################### Saturday
+# ############################################################# Morning
+# Revolutionary Left Radio (3 Hour Slot) 7am-10am
+0 7 * * 6	show	revolutionary_left_radio
+# Long Now Foundation
+0 10 * * 6	show	long_now
+# Demand Utopia
+0 11 * * 6	show	demand_utopia_a_solarpunk_podcast
+# ############################################################# Afternoon
+# Clark's World Magazine
+0 13 * * 6	show	clarkesworld_magazine
+# Escape Pod
+0 14 * * 6	show	escape_pod
+# 12 Byzantine Rulers
+0 15 * * 6	show	12_byzantine_rulers_the_history_of_the_byzantine_empire
+# Norman Centuries
+30 15 * * 6	show	norman_centuries_a_norman_history_podcast_by_lars_brownworth
+# British History
+0 16 * * 6	show	the_british_history_podcast
+# Eyes Left -- Military Anti-war
+0 17 * * 6	show	eyes_left_podcast
+# ############################################################# Evening
+# Evening News KPFA
+0 18 * * 6	stream	https://streams.kpfa.org:8443/kpfa	3600
+# The Dollop
+0 19 * * 6	show	the_dollop_with_dave_anthony_and_gareth_reynolds
+# Common Censored
+0 20 * * 6	show	common_censored
+# Clearing The Fog
+0 21 * * 6	show	clearing_the_fog_with_co_hosts_margaret_flowers_and_kevin_zeese
+# Ashes Ashes (2 Hours)
+0 22 * * 6	show	ashes_ashes
+# ################################################################### Sunday
+# ############################################################# Morning
+# 21st Century Wire
+0 7 * * 7	show	21st_century_wire
+# 2 Skeptical Chaps (2 Hours)
+0 8 * * 7	show	2_skeptical_chaps
+# Citizen Radio
+0 10 * * 7	show	citizen_radio
+# Final Straw Radio
+0 11 * * 7	show	the_final_straw_radio
+# ############################################################# Afternoon
+# From What-if to What-next
+0 13 * * 7	show	from_what_if_to_what_next
+# Frontline Dispatch
+0 14 * * 7	show	the_frontline_dispatch
+# Ralph Nader Radio Hour (2 Hours)
+0 15 * * 7	show	ralph_nader_radio_hour
+# 
+0 17 * * 7	show	history_of_philosophy_india_africana_china
+# KPFA Evening News
+0 18 * * 7    stream    https://streams.kpfa.org:8443/kpfa    3600
+# Keeping Democracy Alive
+0 19 * * 7	show	keeping_democracy_alive_with_burt_cohen
+# Linux in the Ham Shack
+0 20 * * 7	show	linux_in_the_ham_shack
+# MMT Podcast
+0 21 * * 7	show	the_mmt_podcast_with_patricia_pino_christian_reilly
+# Money on the Left
+0 22 * * 7	show	money_on_the_left
+# ############################################################# Evening
+# fin

@@ -1,4 +1,4 @@
-!#/usr/bin/env jruby
+#!/usr/bin/env jruby
 # frozen_string_literal: true
 require "rubygems"
 require "net/http"
@@ -7,6 +7,8 @@ require "json"
 require "digest/sha1"
 require "sequel"
 require "nokogiri"
+require "time"
+require "fileutils"
 unless defined?(Nokogiri::XML)
   raise Exception.new "Nokogiri did NOT load"
 end
@@ -49,13 +51,6 @@ $db_s.execute("PRAGMA busy_timeout=5000;")
 $db_p.execute("PRAGMA journal_mode=WAL;")
 $db_p.execute("PRAGMA busy_timeout=5000;")
 
-# JRuby/Sequel quirk: the JDBC connection binds lazily, and datasets built on
-# $db_p can resolve against the wrong database file ("no such table: main.shows"
-# when inserting episodes). Force each connection to bind to its own file now,
-# while we still have an explicit handle to verify it.
-$db_s.from(:shows).count
-$db_p.from(:episodes).count
-
 def log(level, msg)
   ts = Time.now.strftime("%Y-%m-%d %H:%M:%S")
   line = "[#{ts}] [#{level}] #{msg}"
@@ -66,6 +61,14 @@ def log(level, msg)
     warn "Log write failed: #{e.class} #{e.message}"
   end
 end
+
+FETCH_LOCK = File.join(STATE_DIR, "fetching")
+if File.exist?(FETCH_LOCK)
+  log("INFO", "Fetch already in progress (#{FETCH_LOCK} exists), exiting")
+  exit 0
+end
+FileUtils.touch(FETCH_LOCK)
+at_exit { File.delete(FETCH_LOCK) if File.exist?(FETCH_LOCK) }
 
 def table_count(db, tbl)
   db[:sqlite_master].where(type: 'table', name: tbl).count > 0
@@ -105,10 +108,23 @@ def ensure_schema
   end
 end
 
-ensure_schema
-
 def gen_guid(seed_str)
   Digest::SHA1.hexdigest(seed_str.to_s)
+end
+
+# Dest filenames are built from the episode guid, and some feeds use a
+# permalink URL as the guid (e.g. "https://example.com/?p=1871"). Using it
+# raw puts / : ? characters into the filename, which crosses directories
+# that were never created (Errno::ENOENT). Sanitize: keep filename-safe
+# characters, flatten the rest; when the guid needed flattening, prefix a
+# short SHA1 of the original so two different URL guids cannot collide.
+# Deterministic, so a retried episode regenerates the same name.
+def safe_filename(guid)
+  g = guid.to_s
+  safe = g.gsub(/[^a-zA-Z0-9._-]/, "_")
+  safe = "#{Digest::SHA1.hexdigest(g)[0, 8]}_#{safe}" unless safe == g
+  safe = safe[0, 150]
+  safe.empty? ? "episode" : safe
 end
 
 def generate_slug(title)
@@ -116,24 +132,35 @@ def generate_slug(title)
 end
 
 def http_stream_to_file(url, dest_path, user = nil, pass = nil)
-  uri = URI.parse(url)
+  begin
+    uri = URI.parse(url)
+  rescue URI::InvalidURIError
+    begin
+      uri = URI.parse(URI::DEFAULT_PARSER.escape(url))
+    rescue URI::InvalidURIError
+      log("ERROR", "Unparseable URL, skipping: #{url}")
+      return false
+    end
+  end
   success = false
   tmp_dest = "#{dest_path}.downloading"
 
   begin
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = (uri.scheme == "https")
-    http.open_timeout = 30
-    http.read_timeout = 60
+    http.open_timeout = 60
+    http.read_timeout = 300
 
     req = Net::HTTP::Get.new(uri.request_uri)
     req.add_field("User-Agent", "RadioAutomation/1.0 (JRuby)")
     req.basic_auth(user, pass) if user && !user.empty?
 
     res = nil
+    body = nil
     http.start do |conn|
       conn.request(req) do |response|
         res = response
+        body = response.read_body
       end
     end
 
@@ -146,10 +173,9 @@ def http_stream_to_file(url, dest_path, user = nil, pass = nil)
     unless res.is_a?(Net::HTTPSuccess)
       raise "HTTP #{res.code}: #{res.message}"
     end
-    body = res.read_body
-    # JRuby bug: StringIO#read with a block does not reliably yield chunks,
-    # resulting in a 0-byte file. Write the body directly instead.
-    File.open(tmp_dest, "wb") { |f| f.write(body) }
+    File.open(tmp_dest, "wb") do |f|
+      f.write(body)
+    end
     File.rename(tmp_dest, dest_path)
     success = true
   rescue Exception => error
@@ -172,12 +198,15 @@ def parse_feed(opts)
   channel = doc.at_xpath("//channel")
   if channel
     items = []
-    # JRuby bug: node.elements("tagname") raises ArgumentError under JRuby/Nokogiri.
-    # XPath is the verified-working form (the raw-feed probe used it successfully).
     channel.xpath("./item").each do |item|
       enc = item.at_xpath("./enclosure")
       next unless enc
-      next unless enc.attributes["type"].value =~ /audio/i
+
+      url_attr = enc.attributes["url"]
+      next unless url_attr && url_attr.value && !url_attr.value.empty?
+
+      type_attr = enc.attributes["type"]
+      next unless type_attr && type_attr.value =~ /audio/i
 
       pub_date_raw = item.at_xpath("./pubDate")&.text
       published_at = begin
@@ -192,7 +221,7 @@ def parse_feed(opts)
         d = dur_el.text.strip
         if d.include?(":")
           parts = d.split(":").map(&:to_i)
-          dur_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+          dur_sec = parts.last(3).inject(0) { |acc, p| acc * 60 + p }
         else
           dur_sec = d.to_i
         end
@@ -201,14 +230,12 @@ def parse_feed(opts)
       enc_len = enc.attributes["length"]&.value&.to_i || 0
       est_dur = (enc_len / (128 * 1024)).round if enc_len > 0
 
+      g = item.at_xpath("./guid")&.text
+      enc_url = url_attr.value
       items << {
-        # JRuby has no ActiveSupport; String#presence is unavailable. Use strip + empty? check.
-        guid: begin
-          g = item.at_xpath("./guid")&.text.to_s.strip
-          g.empty? ? nil : g
-        end || gen_guid(enc.attributes["url"].value),
+        guid: (g && !g.strip.empty? ? g : gen_guid(enc_url)),
         title: item.at_xpath("./title")&.text || "Untitled",
-        url: enc.attributes["url"].value,
+        url: enc_url,
         duration_seconds: dur_sec > 0 ? dur_sec : (est_dur || 0),
         file_size_bytes: enc_len,
         published_at: published_at
@@ -266,18 +293,30 @@ def register_show(show_title, feed_url, archive: false, opml_import: false)
  end
 
   log("INFO", "Registered: #{title} (#{slug})")
-  true
+  # Return the stored row, not a bare true: cmd_add_show reads row[:slug] and
+  # row[:title] from this return value. Callers that only test truthiness
+  # (sync_gpodder's "added += 1 if row") behave identically with a hash.
+  $db_s[:shows].where(guid: guid).first
 end
 
 def sync_gpodder
   gpodder_cfg = CFG["gpodder"] || {}
-  return unless gpodder_cfg["enabled"] == true
+  unless gpodder_cfg["enabled"] == true
+    # The previous silent `return unless` made this case indistinguishable
+    # from a successful no-op: --fetch-all then reported "No archived shows
+    # to fetch." with zero gPodder lines in the log. Say why we skipped.
+    log("WARN", "gPodder sync: skipped -- config.json has no \"gpodder\" block with \"enabled\": true")
+    return
+  end
 
   host = gpodder_cfg["host"].to_s.sub(/\Ahttps?:\/\//, "").sub(/\/.*\z/, "")
   username = gpodder_cfg["username"].to_s
   password = gpodder_cfg["password"].to_s
   device_id = gpodder_cfg["device_id"].to_s
-  return if username.empty? || password.empty? || device_id.empty?
+  if username.empty? || password.empty? || device_id.empty?
+    log("WARN", "gPodder sync: skipped -- gpodder.username, gpodder.password and gpodder.device_id must all be non-empty in config.json")
+    return
+  end
 
   full_host = "https://#{host}"
   opml_url = "#{full_host}/subscriptions/#{username}/#{device_id}.opml"
@@ -290,30 +329,57 @@ def sync_gpodder
     return
   end
 
-  opml_doc = Nokogiri::XML(File.read(tmp_opml), nil, XML::NO_NETWORK)
+  # nonet via the block form, the same verified pattern cmd_import_opml uses.
+  # The previous form passed XML::NO_NETWORK -- an undefined constant -- as the
+  # encoding argument, so every sync raised NameError before parsing anything.
+  opml_doc = Nokogiri::XML(File.read(tmp_opml)) { |config| config.nonet }
   remote_shows = []
+  outlines_seen = 0
   opml_doc.xpath("//outline[@xmlUrl]").each do |o|
     xml_url = o.attr("xmlUrl").to_s.strip
-    title = o.attr("title").to_s.strip
     next if xml_url.empty?
-    next unless xml_url =~ /\.(rss|atom)(\?.*)?\z/i
+    outlines_seen += 1
+    # No extension filter: gPodder feed URLs end in .xml, .rss, or nothing at
+    # all, and cmd_import_opml (the verified import path in this file) accepts
+    # any outline with an xmlUrl. Requiring a .rss/.atom ending here rejected
+    # every outline in a real gPodder OPML, leaving "0 added, 0 removed".
+    # Titles: OPML outlines may carry title, text, or both.
+    title = (o.attr("title") || o.attr("text")).to_s.strip
     remote_shows << { url: xml_url, title: title }
   end
+  log("INFO", "gPodder sync: OPML contained #{outlines_seen} outline(s) with xmlUrl")
 
   added = 0
   removed = 0
 
+  # archive: true is the design correction: cmd_fetch_all fetches only shows
+  # with archive = 1, and the gPodder subscription list IS the fetch list.
+  # The elsif flips already-registered rows that are not yet archived, so the
+  # correction also repairs rows created before this change.
   remote_shows.each do |rs|
     existing = $db_s[:shows].where(feed_url: rs[:url]).first
     if existing.nil?
-      row = register_show(rs[:title], rs[:url], 0, 0)
+      # Keyword form matching register_show's signature
+      # (show_title, feed_url, archive: false, opml_import: false). The old
+      # positional call passed 0, 0 against two keyword parameters, which
+      # raises ArgumentError on the first new show and aborts the sync.
+      # opml_import: true because these rows originate from the gPodder OPML;
+      # the prune block below only manages rows it can attribute to the sync.
+      row = register_show(rs[:title], rs[:url], archive: true, opml_import: true)
       added += 1 if row
+    elsif existing[:archive] != 1
+      $db_s[:shows].where(guid: existing[:guid]).update(archive: 1)
+      log("INFO", "gPodder sync: archived '#{existing[:slug]}'")
     end
   end
 
   all_local = $db_s[:shows].all
   all_local.each do |row|
-    if row[:opml_import] == 0
+    # Prune only rows the gPodder sync owns (opml_import = 1): they came from
+    # the OPML and are removed when the subscription vanishes from it. The
+    # previous condition (== 0) was inverted -- it deleted manually added
+    # shows not present in the gPodder list and never pruned synced ones.
+    if row[:opml_import] == 1
       still_remote = remote_shows.any? { |rs| rs[:url] == row[:feed_url] }
       unless still_remote
         $db_p[:episodes].where(show_guid: row[:guid]).delete
@@ -352,7 +418,10 @@ def cmd_add_show(args)
     end
   end
 
-  row = register_show(title, url)
+  # archive: true because cmd_fetch_all fetches only archive = 1 rows, and a
+  # show added by hand is by definition one the station wants. This also
+  # re-archives a previously wiped row on re-registration.
+  row = register_show(title, url, archive: true)
   if row
     log("INFO", "Added show: #{row[:slug]} (#{row[:title]})")
   else
@@ -362,15 +431,38 @@ def cmd_add_show(args)
 end
 
 def cmd_remove_show(slug_or_url)
-  row = $db_s[:shows].where(Sequel.function("lower", Sequel.val(:slug)) =~ "%#{slug_or_url}%" ).first
+  row = $db_s[:shows].where(Sequel.lit("lower(slug) LIKE ?", "%#{slug_or_url}%")).first
   row ||= $db_s[:shows].where(feed_url: slug_or_url).first
   if row.nil?
     log("ERROR", "Show not found: #{slug_or_url}")
     exit 1
   end
+
+  removed_files = 0
+  $db_p[:episodes].where(show_guid: row[:guid]).each do |ep|
+    lp = ep[:local_path]
+    next if lp.nil? || lp.empty?
+    begin
+      File.delete(lp) if File.exist?(lp)
+      removed_files += 1
+    rescue StandardError => e
+      log("WARN", "Could not delete #{lp}: #{e.class}: #{e.message}")
+    end
+  end
+
+  show_dir = File.join(PODCAST_DIR, row[:slug])
+  if Dir.exist?(show_dir)
+    begin
+      Dir.rmdir(show_dir)
+      log("INFO", "Removed empty show directory: #{show_dir}")
+    rescue StandardError
+      # directory not empty (stray files); leave it in place
+    end
+  end
+
   $db_p[:episodes].where(show_guid: row[:guid]).delete
   $db_s[:shows].where(guid: row[:guid]).delete
-  log("INFO", "Removed show: #{row[:slug]} and its episodes")
+  log("INFO", "Removed show: #{row[:slug]} (#{removed_files} episode files deleted) and its episodes")
 end
 
 def cmd_archive(slug_or_url, flag)
@@ -465,71 +557,72 @@ def cmd_fetch_all
 
     next unless parsed
 
-    # Option A: record URL-only episode rows; do NOT pre-download full MP3s.
-    # The old code called http_stream_to_file(ep[:url], dest) for every item
-    # before inserting the row. For BradCast (3028 eps x ~55 MB ~= 167 GB) that
-    # hung/filled disk on the first pull, so zero rows ever landed and
-    # resolve_show had nothing to queue. We now insert immediately with url set
-    # and local_path NULL; liquidsoap streams the remote URL at air time
-    # (resolve_show already falls back to ep[:url] when local_path is absent).
+    show_dir = File.join(PODCAST_DIR, show[:slug])
+    ensure_dir(show_dir)
+
     new_eps = 0
-    skipped_existing = 0
     parsed[:items].each do |ep|
-      # Dedup by guid: skip anything we've already recorded for this feed.
       existing = $db_p[:episodes].where(guid: ep[:guid]).first
       if existing
-        skipped_existing += 1
         next
       end
 
-      # Defensive: require a non-empty playback target. parse_feed only yields
-      # audio enclosures, but guard against a malformed item anyway.
-      url = ep[:url].to_s.strip
-      next if url.empty?
+      filename = "#{safe_filename(ep[:guid])}.mp3"
+      dest = File.join(show_dir, filename)
+      dl_ok = http_stream_to_file(ep[:url], dest)
+      unless dl_ok
+        log("WARN", "Episode download failed for #{show[:slug]}: #{ep[:guid]}, not recorded -- will retry next fetch")
+        next
+      end
+      size = File.size(dest)
 
       now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
-      begin
-        $db_p[:episodes].insert(
-          guid: ep[:guid],
-          show_guid: show[:guid],
-          title: ep[:title],
-          url: url,
-          duration_seconds: ep[:duration_seconds] || 0,
-          played: 0,
-          local_path: nil,            # Option A: stream remotely; no local file
-          file_size_bytes: ep[:file_size_bytes] || 0,
-          created_at: now
-        )
-        new_eps += 1
-      rescue StandardError => e
-        # Log per-item failures instead of letting one bad row abort the whole
-        # show (and silently lose every remaining episode).
-        log("WARN", "Insert failed for #{show[:slug]} ep #{ep[:guid]}: #{e.message}")
-      end
+      $db_p[:episodes].insert(
+        guid: ep[:guid],
+        show_guid: show[:guid],
+        title: ep[:title],
+        url: ep[:url],
+        duration_seconds: ep[:duration_seconds],
+        played: 0,
+        local_path: dest,
+        file_size_bytes: size,
+        created_at: now
+      )
+      new_eps += 1
     end
-    log("INFO", "#{show[:slug]}: #{new_eps} new episodes recorded (#{skipped_existing} already known)")
+    log("INFO", "#{show[:slug]}: #{new_eps} new episodes downloaded")
   end
 end
 
-sync_gpodder
+begin
+  ensure_schema
+  sync_gpodder
 
-command = ARGV.shift
-case command
-when "--list"
-  detail = ARGV.include?("--detail")
-  cmd_list(detail)
-when "--add-show"
-  cmd_add_show(ARGV)
-when "--remove"
-  cmd_remove_show(ARGV.first)
-when "--archive"
-  cmd_archive(ARGV.first, true)
-when "--unarchive"
-  cmd_archive(ARGV.first, false)
-when "--import-opml"
-  cmd_import_opml(ARGV.first)
-when "--fetch-all"
-  cmd_fetch_all
-else
-  puts "Usage: fetch_podcasts.rb [--list|--detail|--add-show <url>|--remove <slug>|--archive <slug>|--unarchive <slug>|--import-opml <file>|--fetch-all]"
+  command = ARGV.shift
+  case command
+  when "--list"
+    detail = ARGV.include?("--detail")
+    cmd_list(detail)
+  when "--add-show"
+    cmd_add_show(ARGV)
+  when "--remove"
+    cmd_remove_show(ARGV.first)
+  when "--archive"
+    cmd_archive(ARGV.first, true)
+  when "--unarchive"
+    cmd_archive(ARGV.first, false)
+  when "--import-opml"
+    cmd_import_opml(ARGV.first)
+  when "--fetch-all"
+    cmd_fetch_all
+  else
+    puts "Usage: fetch_podcasts.rb [--list|--detail|--add-show <url>|--remove <slug>|--archive <slug>|--unarchive <slug>|--import-opml <file>|--fetch-all]"
+  end
+rescue SystemExit
+  raise
+rescue Exception => e
+  log("ERROR", "Unhandled exception: #{e.class}: #{e.message}, Backtrace --> #{e.backtrace}")
+  raise
+ensure
+  File.delete(FETCH_LOCK) if File.exist?(FETCH_LOCK)
 end

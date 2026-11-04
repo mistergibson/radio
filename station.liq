@@ -19,10 +19,11 @@ settings.log.level.set(3)
 # --- Load config ---
 # Explicit type annotation required: without it, fields used only in #{...}
 # interpolations default to null (see liquidsoap json docs).
-let json.parse ({ storage, icecast = { host, port, mount, source_username, source_password } }
+let json.parse ({ storage, icecast = { host, port, mount, source_username, source_password, ssl_certificate } }
                 : { storage: string,
                     icecast: { host: string, port: int, mount: string,
-                               source_username: string, source_password: string } })
+                               source_username: string, source_password: string,
+                               ssl_certificate: string } })
   = file.contents("config.json")
 
 storage_base = storage
@@ -47,7 +48,19 @@ icecast_mount = mount
 icecast_user = source_username
 icecast_pass = source_password
 
+# TLS when and only when config.json names a certificate and that file is
+# present on disk. config.json remains the single source of truth: set
+# "ssl_certificate" to "" there to revert the station to plain HTTP, or
+# remove/rename the cert file to force plain HTTP without editing anything.
+# (file.exists is the same stdlib function read_queue already uses.)
+use_ssl = ssl_certificate != "" and file.exists(ssl_certificate)
+
 print("Config loaded: storage=#{storage_base}, icecast=#{icecast_host}:#{icecast_port}#{icecast_mount}")
+if use_ssl then
+  print("Icecast transport: TLS (#{ssl_certificate})")
+else
+  print("Icecast transport: plain HTTP")
+end
 
 # --- Background source: rotate among the featured directories, with 0.5 s
 # crossfades between tracks. Each playlist(dir) reads its directory
@@ -55,16 +68,22 @@ print("Config loaded: storage=#{storage_base}, icecast=#{icecast_host}:#{icecast
 music_pl         = playlist(music_dir)
 jingles_pl       = playlist(jingles_dir)
 announcements_pl = playlist(announcements_dir)
-podcasts_pl      = playlist(podcasts_dir)
+# NOTE: podcasts are deliberately NOT in this rotation. The podcasts directory
+# holds the full downloaded archive (36k+ episodes); any directory in the
+# rotate pool is played whenever nothing is scheduled, so including it here
+# made unscheduled podcast episodes air during every schedule gap. Scheduled
+# podcast episodes still play through the queue; only the background rotation
+# no longer reaches into the archive. (Defining podcasts_pl = playlist(...) is
+# also avoided: playlist(dir) indexes the whole tree at startup.)
 
-# Rotate among the four directories. NO transition_length and NO transitions:
+# Rotate among the three directories. NO transition_length and NO transitions:
 # both default to a plain hard cut (transition_length defaults to 5.0, which is
 # what the outgoing track's "4.94585034014s remaining" was reporting -- rotate
 # was composing a ~5s layer transition while the crossfade above it composed a
 # 0.5s blend over the SAME boundary, so the two got out of sync and the
 # crossfade's buffer went stale). rotate now hands off with a hard cut;
 # crossfade is the only operator that blends.
-rotating_bg = rotate([music_pl, jingles_pl, announcements_pl, podcasts_pl])
+rotating_bg = rotate([music_pl, jingles_pl, announcements_pl])
 
 # Crossfade 0.5 s between consecutive tracks of the rotated stream. This is the
 # ONLY operator composing transitions; see the note above.
@@ -190,17 +209,43 @@ mux = fallback(track_sensitive=false, [show_source, background_music])
 main_out = mksafe(mux)
 
 # --- Output to Icecast ---
-output.icecast(
-  %mp3(bitrate=128),
-  host=icecast_host,
-  port=icecast_port,
-  user=icecast_user,
-  password=icecast_pass,
-  mount=icecast_mount,
-  name="Road Unit Radio",
-  description="Community radio automation",
-  genre="various",
-  url="",
-  public=true,
-  main_out
-)
+# One branch per transport. The TLS branch passes transport=http.transport.ssl(),
+# the exact form the icecast documentation prescribes for HTTPS output: a CALL
+# returning the http_transport value (the parameter's declared type), with NO
+# arguments because the output is a TLS CLIENT -- the certificate/key parameters
+# are for server mode, and client verification goes through the system trust
+# store. The plain branch passes NO transport token, so it uses the build's
+# default transport, which is exactly the behavior this file has always had.
+# Every argument except the transport line is identical between branches.
+if use_ssl then
+  output.icecast(
+    %mp3(bitrate=128),
+    host=icecast_host,
+    port=icecast_port,
+    user=icecast_user,
+    password=icecast_pass,
+    mount=icecast_mount,
+    transport=http.transport.ssl(),
+    name="Community Radio",
+    description="Community radio automation",
+    genre="various",
+    url="",
+    public=true,
+    main_out
+  )
+else
+  output.icecast(
+    %mp3(bitrate=128),
+    host=icecast_host,
+    port=icecast_port,
+    user=icecast_user,
+    password=icecast_pass,
+    mount=icecast_mount,
+    name="Community Radio",
+    description="Community radio automation",
+    genre="various",
+    url="",
+    public=true,
+    main_out
+  )
+end

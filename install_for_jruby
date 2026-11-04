@@ -147,10 +147,10 @@ cat > "${CONFIG_JSON}" <<EOF
     "port": ${ICECAST_PORT},
     "mount": "${ICECAST_MOUNT}",
     "source_username": "${ICECAST_SRC_USER}",
-    "source_password": "${ICECAST_SRC_PASS}"
-  },
+    "source_password": "${ICECAST_SRC_PASS}",
+    "ssl_certificate": "" },
   "gpodder": {
-    "enable": ${GP_ENABLED},
+    "enabled": ${GP_ENABLED},
     "host": "${GP_HOST}",
     "username": "${GP_USERNAME}",
     "password": "${GP_PASSWORD}",
@@ -160,7 +160,6 @@ cat > "${CONFIG_JSON}" <<EOF
 EOF
 chmod 600 "${CONFIG_JSON}"
 echo "==> Wrote ${CONFIG_JSON}"
-
 # --- Generate systemd unit ----------------------------------------------------
 cat > "${UNIT_PATH}" <<EOF
 [Unit]
@@ -169,6 +168,28 @@ After=network-online.target sound.target
 Wants=network-online.target
 
 [Service]
+# Protect the radio's realtime clock from being starved by other work on the
+# box. Diagnosed Oct 2026: the main clock was running at ~0.4x realtime and
+# liquidsoap's [clock.main] thread was being descheduled while a Waterfox
+# desktop session and Jellyfin pushed the machine deep into swap.
+# These settings give the unit a floor so it cannot be pushed off the CPU,
+# off the disk, or out to swap.
+#
+# Requires cgroup v2 (unified hierarchy). Confirm with:
+#     stat -fc %T /sys/fs/cgroup      # expect: cgroup2fs
+#
+# CPU share: top of the 1-10000 range (kernel default is 100)
+CPUWeight=10000
+# Disk I/O share: top of the 1-10000 range (default 100)
+IOWeight=10000
+# Keep the working set resident under memory pressure:
+# 512M hard-protected (memory.min), 1G best-effort (memory.low)
+MemoryMin=512M
+MemoryLow=1G
+# The one that matters: never let liquidsoap's pages go to swap.
+# A realtime clock thread cannot make its deadlines from disk.
+MemorySwapMax=0
+#
 Type=simple
 User=liquidsoap
 WorkingDirectory=${INSTALL_DIR}
