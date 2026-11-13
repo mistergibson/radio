@@ -25,6 +25,8 @@ This README documents the **current architecture**: a single queue file (`curren
         "show"  -> episode local path or media URL (resolved from SQLite, marked played)
         "stream"-> LOCAL capture path: ffmpeg records the live URL into
                    <storage>/captures/*.mp3 and that growing file is queued
+        "shim"  -> same resolution as "show", but queued ONLY when the item
+                   already in the queue has stopped playing (filler)
                              |
                              v
               station.liq  (liquidsoap, started by station.rb)
@@ -35,8 +37,9 @@ This README documents the **current architecture**: a single queue file (`curren
                 fallback(track_sensitive=false) --- blank() safety (mksafe)
                              |                \
                              v                 -> rotating background music
-                       output.icecast          (music/jingles/announcements/
-                         %mp3 128k              podcasts, 0.5s crossfade)
+                       output.icecast          (music/jingles/announcements,
+                         %mp3 128k, TLS when    0.5s crossfade)
+                         configured)
                              |
                              v
                     Icecast (host:port/mount)
@@ -53,14 +56,14 @@ The key design decision: **liquidsoap never relays a live Icecast mount directly
 | File | Role |
 |---|---|
 | `station.rb` | 3-line entry point: `cd`s to its own directory (which exports `RADIO_DIR` for the silence fallback) and `exec`s liquidsoap on `station.liq`. This is what the systemd unit runs. |
-| `station.liq` | The Liquidsoap config: queue-reading `request.dynamic`, poller, fallback mux, background music, Icecast output. |
-| `scheduler.rb` | The clock. Run from cron every minute; matches `schedule.txt` against the current time and writes the due URI into the queue file. Includes two dry-fire dev hooks. |
+| `station.liq` | The Liquidsoap config: queue-reading `request.dynamic`, poller, fallback mux, background music, Icecast output (plain HTTP or TLS per `config.json`). |
+| `scheduler.rb` | The clock. Run from cron every minute; matches `schedule.txt` against the current time and writes the due URI into the queue file. Includes three dry-fire dev hooks. |
 | `fetch_podcasts.rb` | Podcast ingestion: add/remove/archive shows, import OPML, download new episodes, sync with a gPodder server. |
 | `update_playlists.rb` | **Legacy.** Writes per-show playlist files under `storage/queue/`. Superseded by `scheduler.rb`'s direct queue writes; kept for reference and its `--json` inventory report. Not in the air path. |
 | `run_radio.sh` | Launcher for every JRuby script: sets the gem environment and JVM heap, then `exec`s jruby. |
 | `console.sh` | Interactive `jirb` console with the same gem environment, running as the `liquidsoap` user. |
 | `install_for_jruby` | One-shot installer: gems, databases, `config.json`, systemd unit, cron entries. |
-| `config.json` | Storage root, Icecast connection, gPodder credentials. |
+| `config.json` | Storage root, Icecast connection (including the optional TLS certificate path), gPodder credentials. |
 | `schedule.txt` | The schedule, in cron style. |
 
 ## Directory layout
@@ -81,7 +84,9 @@ Everything lives under the storage root chosen at install time (default `/mnt/st
     fetch_podcasts.log, scheduler_cron.log, fetch_cron.log, update_cron.log, ...
   queues/
     current_queue.txt  THE queue: exactly one bare URI, nothing else
-    current_queue.meta THE sidecar: one epoch integer, the second the item stops airing
+    current_queue.meta THE sidecar: two epoch integers -- slot expiry (when the
+                       queue clears) and actual end (when the item stops
+                       playing; see "Expiry" below)
   captures/
     <host>_<YYYYMMDD_HHMMSS>.mp3   ffmpeg stream captures (pruned after 2 days)
     *.fflog                        each capture's ffmpeg stderr
@@ -128,7 +133,8 @@ Then review `config.json` and `systemctl start radio`.
     "port": 7777,
     "mount": "/data",
     "source_username": "source",
-    "source_password": "..."
+    "source_password": "...",
+    "ssl_certificate": "/etc/icecast2/ssl/cdc.pem"
   },
   "gpodder": {
     "enabled": true,
@@ -142,7 +148,7 @@ Then review `config.json` and `systemctl start radio`.
 
 `fetch_podcasts.rb` treats gPodder sync as active only when `gpodder.enabled` is exactly `true` **and** `username`, `password`, and `device_id` are all non-empty. The OPML subscription list is read from `https://<host>/subscriptions/<username>/<device_id>.opml`.
 
-Note: the bundled installer writes this block with the key `"enable"` rather than `"enabled"`. The code reads `enabled`. If gPodder sync silently does nothing after an install, check which key your `config.json` actually has and set `"enabled": true`.
+**TLS output.** `icecast.ssl_certificate` is optional. When it names a certificate file that exists on disk, `station.liq` connects to Icecast over TLS (`transport=http.transport.ssl()`); when the key is `""` or the file is missing, the output falls back to plain HTTP. `config.json` remains the single source of truth: no separate configuration of the transport exists. At startup the loaded-config line prints which transport was chosen (`Icecast transport: TLS (...)` or `Icecast transport: plain HTTP`).
 
 ---
 
@@ -154,17 +160,34 @@ Whitespace-separated fields, cron style:
 #  min  hour  dom  mon  dow  TYPE    TARGET                    [RUNLENGTH_SECONDS]
      0    7    *    *    1-5  stream  https://streams.kpfa.org:8443/kpfa   3600
     30   12    *    *    *    show    the_history_of_rome
+    45   12    *    *    *    shim    conservation_news    1800
 ```
 
 Lines starting with `#` and blank lines are ignored. The five time fields support `*`, a single number `N`, a range `A-B`, a step `*/S`, and comma lists of any of those (`0,30`, `9-17/2`). `dow` is 0-6 with Sunday = 0.
 
-`TYPE` is `show` or `stream`.
+`TYPE` is `show`, `stream`, or `shim`.
 
-**`show`**: `TARGET` is a show slug (or feed URL). At fire time the scheduler looks the slug up in `subscriptions.db`, picks the most recent unplayed episode from `played.db`, marks it played, and queues its `local_path` (falling back to its `url`). `RUNLENGTH`, when given, is the number of seconds the item stays on air; without one the slot is capped at 4 hours so background music always resumes. An entry with no playable episode is *deferred*, not marked fired, and retries the next minute.
+**`show`**: `TARGET` is a show slug (or feed URL). At fire time the scheduler looks the slug up in `subscriptions.db`, picks the most recent unplayed episode from `played.db`, marks it played, and queues its `local_path` (falling back to its `url`). `RUNLENGTH`, when given, is the number of seconds the item stays on air; without one the slot is capped at 4 hours so background music always resumes. An entry with no playable episode is *deferred*, not marked fired, and retries the next minute. When the episode's duration is known, the scheduler also stamps the item's real playing end (fire time + the lesser of runlength and duration) into the queue sidecar; see **Expiry** below for what that stamp is used for.
 
-**`stream`**: `TARGET` is a live media URL. The scheduler starts ffmpeg recording it to `captures/<host>_<timestamp>.mp3` for `RUNLENGTH` seconds (default 3600), waits about 5 seconds, and queues the *local capture path* once the file has real bytes in it. The queue TTL is the capture length plus 300 seconds of slack. If ffmpeg produced nothing within 5 seconds, the queue is cleared instead, so background music carries the slot rather than a stale URI. This is how a finite-length slot of a continuous stream gets played: the capture is a growing MP3 that liquidsoap reads as an open-ended stream until the writer stops.
+**`stream`**: `TARGET` is a live media URL. The scheduler starts ffmpeg recording it to `captures/<host>_<timestamp>.mp3` for `RUNLENGTH` seconds (default 3600), waits about 5 seconds, and queues the *local capture path* once the file has real bytes in it. The queue TTL is the capture length plus 300 seconds of slack. If ffmpeg produced nothing within 5 seconds, the queue is cleared instead, so background music carries the slot rather than a stale URI. This is how a finite-length slot of a continuous stream gets played: the capture is a growing MP3 that liquidsoap reads as an open-ended stream until the writer stops. The capture length is stamped as the item's playing end in the sidecar.
 
-**Expiry.** Every queued item is stamped with an absolute end time (epoch seconds) in `current_queue.meta`. Each scheduler tick clears the queue file once that time has passed, so a finished episode or capture never replays and background music resumes on its own. Worst-case overshoot is one cron minute.
+**`shim`**: `TARGET` is a show slug, resolved exactly like `show` -- but a shim is *filler*, not a program. It queues an episode only when nothing is actually playing. The guard reads the queue sidecar's **actual end** stamp (see **Expiry**): while that stamp is in the future, the queued item is still on air and the shim is skipped (`SKIP shim '<slug>': queued item still playing until ...`), *not* marked fired, and it retries on the next tick. Three cases never block a shim:
+
+- a `show` whose episode duration was known, once its real playing end has passed (a show that ends before its allotment stops blocking filler at its real end, not at the slot end);
+- a legacy sidecar holding a single epoch integer (no duration evidence at all -- stale entries left by an older scheduler let the shim cut in);
+- an empty queue, where the shim fires like a plain `show` with its own `RUNLENGTH`.
+
+An entry whose duration is unknown is protected conservatively: its playing end is recorded as the slot end, so a shim waits for the slot rather than risk clobbering a show that landed on time. When a shim does fire over a slot that is still open, its `RUNLENGTH` is capped at the remaining slot time, so the filler hands back to background music exactly where the interrupted entry would have -- and chained shim fires stay anchored to that same end.
+
+**Scheduling pattern for shims.** Because a shim must be evaluated every minute during the window a show might end early, give shim lines a `*` in the minute field across the risk window rather than a single minute:
+
+```
+*  12    *    *    *    shim    conservation_news    1800
+```
+
+On SKIP or DEFER the shim does not write its fire marker, so with `*` it re-evaluates every minute and fires the moment the queue goes quiet. A single-minute line (`45 12 * * ...`) gets exactly one chance per day. Note the known trade-off: a shim-fired episode shorter than its runlength leaves its URI in the queue (liquidsoap replays it) until the runlength expires unless a later shim tick fires the next episode -- which is exactly what the `*` minute field provides.
+
+**Expiry.** Every queued item is stamped in `current_queue.meta` with two absolute epoch times: the **slot expiry** (when the queue file is cleared; runlength, or 4 hours for an unrunlengthed show, capture length + 300 for a stream) and the **actual end** (when the item is expected to STOP PLAYING: fire + min(runlength, episode duration) for a show with known duration, capture length for a stream, or the slot expiry itself when the duration is unknown). Each scheduler tick clears the queue file once the slot expiry has passed, so a finished episode or capture never replays and background music resumes on its own. Worst-case overshoot is one cron minute. The shim guard reads the actual end, not the slot expiry -- a shim may cut in long before the slot expires. A sidecar written by an older version of the scheduler holds a single integer: that is read as slot expiry with *no* duration evidence, and it never blocks a shim.
 
 ---
 
@@ -174,7 +197,7 @@ All JRuby scripts are invoked through the launcher (see `run_radio.sh` below), e
 
 ### scheduler.rb
 
-Runs every minute from cron. On each tick, in order: expires the queue if its sidecar time has passed, then (unless a dry-fire hook was given) prunes old fire markers and captures, loads `schedule.txt`, and fires every entry matching the current minute. Idempotency: each entry fires at most once per calendar minute, tracked by a marker file named `<YYYYMMDDHHMM>_<entry-index>` in `state/fire_markers/`; markers older than one day are pruned.
+Runs every minute from cron. On each tick, in order: expires the queue if its sidecar slot expiry has passed, then (unless a dry-fire hook was given) prunes old fire markers and captures, loads `schedule.txt`, and fires every entry matching the current minute. Idempotency: each entry fires at most once per calendar minute, tracked by a marker file named `<YYYYMMDDHHMM>_<entry-index>` in `state/fire_markers/`; markers older than one day are pruned. A `shim` entry that skips or defers writes no marker, so it retries on the next tick.
 
 Queue writes are atomic (temp file + rename), and the queue file is kept to exactly one bare URI with no trailing annotation, because `station.liq` hands the file's contents straight to `request.create`.
 
@@ -185,8 +208,9 @@ Options:
 | *(no arguments)* | Normal cron tick: expire check, then match `schedule.txt` against the current time and fire. |
 | `--dryfire-stream <url> [seconds]` | Fire one stream capture immediately, bypassing the clock match. Records `<url>` with ffmpeg for `[seconds]` (default 3600) and queues the local capture exactly as a scheduled `stream` entry would. For testing the capture path without waiting for a scheduled minute. |
 | `--dryfire-show <slug>` | Run the exact `show` resolution path a scheduled entry uses (lookup, pick most recent unplayed episode, mark it played, queue it), immediately. Queues nothing (background continues) if the slug has no playable episode. |
+| `--dryfire-shim <slug> [seconds]` | Run the exact `shim` path a scheduled entry uses, immediately: guard check against the queue sidecar, remaining-slot runlength cap, resolution, queue write. With an empty queue it fires like a plain show (its own `[seconds]`, default 1800). Useful for testing both outcomes: over a playing item it must SKIP; over a finished or stale entry it must fire. |
 
-Example log lines worth knowing: `RESOLVED:` (episode chosen), `QUEUED show:` / `QUEUED stream capture:` (URI written), `EXPIRED:` (slot over, queue cleared), `SKIP (already fired this minute):`, `DEFERRED: no playable episode yet`, and `STREAM CAPTURE started:` with the ffmpeg pid.
+Example log lines worth knowing: `RESOLVED:` (episode chosen, with its duration), `QUEUED show:` / `QUEUED stream capture:` (URI written; the show line also states the playing length -- `plays ~Ns` when the duration is known, `unknown length, protected to slot end` otherwise), `SHIM: slot open but item finished; filling remaining Ns` (shim firing over an open slot), `SKIP shim '<slug>': queued item still playing until <time>` (shim guard held), `EXPIRED:` (slot over, queue cleared), `SKIP (already fired this minute):`, `DEFERRED: no playable episode yet`, and `STREAM CAPTURE started:` with the ffmpeg pid.
 
 ### fetch_podcasts.rb
 
@@ -204,7 +228,7 @@ fetch_podcasts.rb [--list|--detail|--add-show <url>|--remove <slug>|--archive <s
 |---|---|
 | `--list` | Print all registered shows ordered by slug: slug, title, archive flag. |
 | `--list --detail` | `--detail` is a modifier on `--list`, not a standalone command. Adds per-show episode counts: episodes total and unplayed. |
-| `--add-show <url>` | Register a podcast feed. Probes the feed (to `/tmp/radio_feed_probe.xml`) to derive its title, then inserts the show with a fresh slug. |
+| `--add-show <url>` | Register a podcast feed. Probes the feed (to `/tmp/radio_feed_probe.xml`) to derive its title, then inserts the show with a fresh slug. Registering a title that already exists creates a *second* record under a new slug rather than re-pointing the original; to change a feed URL, update the `shows` row directly in `subscriptions.db`. |
 | `--remove <slug>` | Remove a show, matched by case-insensitive substring against slugs or by exact feed URL. Deletes its episodes from `played.db`, then the show itself. |
 | `--archive <slug>` | Mark a show archived. Only archived shows are fetched by `--fetch-all` and only archived shows are eligible for scheduled `show` slots' reset cycle. |
 | `--unarchive <slug>` | Clear the archive flag. |
@@ -238,6 +262,7 @@ The JVM is started with `-J-Xms256m -J-Xmx2g`. Note this JRuby build ignores `JR
 ```
 sudo -u liquidsoap ./run_radio.sh fetch_podcasts.rb --fetch-all
 sudo -u liquidsoap ./run_radio.sh scheduler.rb --dryfire-stream "https://streams.kpfa.org:8443/kpfa" 300
+sudo -u liquidsoap ./run_radio.sh scheduler.rb --dryfire-shim conservation_news 1800
 ```
 
 ### console.sh
@@ -261,9 +286,9 @@ The Liquidsoap config is extensively commented in the file itself; the load-bear
 
 **Cut-in timing.** `fallback(track_sensitive=false, [show_source, background_music])` is what makes a scheduled show cut in live at its appointed time rather than waiting for the current background track to finish. `mksafe` wraps the mux so the encoder never starves.
 
-**Background music.** Four `playlist(dir)` sources (music, jingles, announcements, podcasts) under `rotate`, wrapped in one `crossfade(fade_in=0.5, fade_out=0.5, duration=0.5, ...)`. `duration` is how much audio crossfade buffers *in advance* per track, not the fade length; sizing it to the fade means a track shorter than the buffer cannot empty it (the buffer-emptied collapse). `minimum` is deliberately omitted: on this build it is a threshold on the cross's own duration, and any minimum above 0.5 vetoes every handoff with "Not enough data for crossing". `rotate` carries no `transition_length` and no `transitions`, so it hands off with a hard cut and crossfade is the only operator composing transitions. There is deliberately no crossfade above the `fallback`: layer handoffs (a show expiring mid-frame) are hard cuts, so the encoder only ever sees complete, valid frames.
+**Background music.** Three `playlist(dir)` sources (music, jingles, announcements) under `rotate`, wrapped in one `crossfade(fade_in=0.5, fade_out=0.5, duration=0.5, ...)`. The podcasts directory is deliberately NOT in the rotation: it holds the full downloaded archive (36k+ episodes), and any directory in the rotate pool plays whenever nothing is scheduled, so including it aired unscheduled podcast episodes during every schedule gap. Scheduled podcast episodes still play through the queue; only the background rotation no longer reaches into the archive. `duration` is how much audio crossfade buffers *in advance* per track, not the fade length; sizing it to the fade means a track shorter than the buffer cannot empty it (the buffer-emptied collapse). `minimum` is deliberately omitted: on this build it is a threshold on the cross's own duration, and any minimum above 0.5 vetoes every handoff with "Not enough data for crossing". `rotate` carries no `transition_length` and no `transitions`, so it hands off with a hard cut and crossfade is the only operator composing transitions. There is deliberately no crossfade above the `fallback`: layer handoffs (a show expiring mid-frame) are hard cuts, so the encoder only ever sees complete, valid frames.
 
-**Output.** `output.icecast(%mp3(bitrate=128), ...)` to the host/port/mount from `config.json`, connection parameters loaded via `let json.parse` with an explicit type annotation (without it, fields used only in string interpolations default to null).
+**Output.** `output.icecast(%mp3(bitrate=128), ...)` to the host/port/mount from `config.json`, connection parameters loaded via `let json.parse` with an explicit type annotation (without it, fields used only in string interpolations default to null). The transport is chosen at startup: when `icecast.ssl_certificate` names an existing certificate file the output connects over TLS (`transport=http.transport.ssl()`, the form the Icecast documentation prescribes for HTTPS output); otherwise it uses the build's default plain-HTTP transport. Every other argument is identical between the two branches.
 
 ---
 
@@ -281,17 +306,18 @@ The Liquidsoap config is extensively commented in the file itself; the load-bear
 - A queued item starting: `[requests:3] Prepared "<path or uri>" (RID N).`
 - A show ending naturally: `[decoder:2] Decoding "<path>" ended: Ffmpeg_decoder.End_of_file` followed within a second by the next request's `Prepared`. That pair is the healthy end-of-slot signature.
 - Queue handoff: `[mksafe:3] Switch to ...` lines around a fire.
-- Scheduler activity: `RESOLVED` / `QUEUED` / `EXPIRED` / `SKIP` lines in `scheduler_cron.log`.
+- Scheduler activity: `RESOLVED` / `QUEUED` / `SHIM` / `SKIP shim` / `EXPIRED` / `SKIP` lines in `scheduler_cron.log`.
 
 **Sanity checks.**
 
-- Is anything queued? `cat <storage>/queues/current_queue.txt` (empty means background music is on air) and `cat <storage>/queues/current_queue.meta` (epoch second the slot ends).
+- Is anything queued? `cat <storage>/queues/current_queue.txt` (empty means background music is on air) and `cat <storage>/queues/current_queue.meta` (two epoch integers: slot expiry, then the playing end the shim guard reads).
 - Did a slot fire? `ls <storage>/state/fire_markers/ | tail` and the scheduler log.
 - Test a stream slot without waiting for its clock time: `./run_radio.sh scheduler.rb --dryfire-stream "<url>" 300`.
 - Test a show slot: `./run_radio.sh scheduler.rb --dryfire-show <slug>`.
+- Test the shim guard both ways: over a playing item `./run_radio.sh scheduler.rb --dryfire-shim <slug> 1800` must SKIP; over an empty or finished queue it must fire.
 - Show inventory: `./run_radio.sh fetch_podcasts.rb --list --detail`.
 - Episode inventory as JSON: `./run_radio.sh update_playlists.rb --json`.
 
 **Housekeeping is automatic.** Fire markers older than one day and captures older than two days are pruned each scheduler tick. A capture's `.fflog` is ffmpeg's stderr for that capture, next to the MP3.
 
-**Restarting.** `systemctl restart radio`. On start, `station.liq` prints the loaded config line; if `RADIO_DIR` is unset you will see an explicit WARNING that the silence fallback will not resolve, which means the service was not started via `station.rb`/the systemd unit.
+**Restarting.** `systemctl restart radio`. On start, `station.liq` prints the loaded config line; if `RADIO_DIR` is unset you will see an explicit WARNING that the silence fallback will not resolve, which means the service was not started via `station.rb`/the systemd unit. Note that deploying a new `scheduler.rb` needs no restart at all: cron launches it fresh each minute, and liquidsoap never loads it.

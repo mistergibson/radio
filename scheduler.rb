@@ -14,6 +14,13 @@
 #   show   -> look up the slug in subscriptions.db, find the next unplayed
 #             episode in played.db (prefer local_path, fall back to url),
 #             mark it played, and write that path/url.
+#   shim   -> like show, but fires only when nothing is actually playing.
+#             Every queued item records its REAL end (episode duration or
+#             capture length) in current_queue.meta alongside the slot end;
+#             while that real end is in the future the shim is skipped and
+#             retried next minute. Filler fired over a still-open slot is
+#             TTL-capped at the remaining slot, so it hands back to background
+#             music exactly where the interrupted entry would have.
 #
 # Expiry: each queued item gets an end time in queues/current_queue.meta
 # (RUNLENGTH for shows, capped at 4h without one; RUNLENGTH+300s for stream
@@ -44,11 +51,15 @@ QUEUE_DIR = File.join(STORAGE, "queues")
 # Single queue file, consumed by one request.dynamic in station.liq. Both show
 # and stream entries write their URI here; whichever is due overwrites it.
 QUEUE_FILE      = File.join(QUEUE_DIR, "current_queue.txt")
-# Sidecar for QUEUE_FILE: a single epoch integer = the wall-clock second at
-# which the queued item stops airing. Written whenever a URI is queued with a
-# TTL, deleted whenever the queue is cleared. Each cron tick checks it and
-# clears the queue once expired, so a finished episode never replays and
-# background music resumes on its own.
+# Sidecar for QUEUE_FILE: two epoch integers separated by a space --
+# "<slot_expiry> <actual_end>". slot_expiry is the wall-clock second at which
+# the queued item stops airing (the queue is cleared and background music
+# resumes); actual_end is the second at which it is expected to STOP PLAYING
+# (episode duration or capture length), which is what the shim guard reads.
+# Written whenever a URI is queued with a TTL, deleted whenever the queue is
+# cleared. Each cron tick checks slot_expiry and clears the queue once
+# expired. Legacy files holding a single integer are read as
+# actual_end == slot_expiry.
 QUEUE_META      = File.join(QUEUE_DIR, "current_queue.meta")
 FIRE_MARKER_DIR = File.join(STATE_DIR, "fire_markers")
 # Live-capture output dir: ffmpeg writes scheduled stream slots here as finite
@@ -120,7 +131,7 @@ def parse_schedule(path)
     target = parts[6]
     runlength = parts[7]&.to_i
 
-    unless %w[show stream].include?(type)
+    unless %w[show stream shim].include?(type)
       log("WARN: unknown TYPE '#{type}' in line: #{line}")
       next
     end
@@ -185,7 +196,11 @@ def open_played_db
 end
 
 # Resolve a show slug to the next unplayed episode's playable path/url.
-# Returns a String (local path or remote URL) or nil if nothing is available.
+# Returns [playable, duration_seconds] -- playable is a String (local path or
+# remote URL) or nil if nothing is available; duration_seconds is the episode's
+# real length from played.db (may be nil), consumed by fire_show for the
+# actual_end stamp the shim guard reads. The early nil guards below destructure
+# safely: a nil return arrives at the caller as [nil, nil].
 def resolve_show(slug)
   subs_db = open_subs_db
   played_db = open_played_db
@@ -225,8 +240,8 @@ def resolve_show(slug)
   # Mark as played atomically before returning, so a crash mid-fire doesn't
   # cause a double-play on the next run.
   played_db[:episodes].where(guid: ep[:guid]).update(played: 1)
-  log("RESOLVED: show '#{slug}' -> #{playable} (episode: #{ep[:title]})")
-  playable
+  log("RESOLVED: show '#{slug}' -> #{playable} (episode: #{ep[:title]}, #{ep[:duration_seconds] || '?'}s)")
+  [playable, ep[:duration_seconds]]
 ensure
   subs_db&.disconnect
   played_db&.disconnect
@@ -239,10 +254,12 @@ end
 # Atomic write: temp file in the same dir, then rename over the target so
 # station.liq never reads a partially-written file.
 
-# ttl_sec: when > 0, stamp QUEUE_META with an expiry time (now + ttl_sec) so a
+# ttl_sec: when > 0, stamp QUEUE_META with a slot expiry (now + ttl_sec) so a
 # later cron tick clears the queue once the slot is over. When nil/0, leave any
 # existing meta untouched (the queue keeps whatever expiry it already had).
-def write_uri_file(path, uri, ttl_sec = nil)
+# actual_sec: when > 0, stamp the item's real playing end (now + actual_sec)
+# alongside the slot expiry; nil records actual_end == slot_expiry.
+def write_uri_file(path, uri, ttl_sec = nil, actual_sec = nil)
   tmp = "#{path}.tmp"
   begin
     File.write(tmp, uri)
@@ -255,15 +272,18 @@ def write_uri_file(path, uri, ttl_sec = nil)
     File.delete(tmp) if File.exist?(tmp)
   end
   if ttl_sec && ttl_sec.to_i > 0
-    write_queue_meta(Time.now.to_i + ttl_sec.to_i)
+    write_queue_meta(Time.now.to_i + ttl_sec.to_i,
+                     actual_sec ? Time.now.to_i + actual_sec.to_i : nil)
   end
 end
 
 # Best-effort: expiry bookkeeping must never block a fire.
-def write_queue_meta(epoch)
+# Writes "<slot_expiry> <actual_end>"; actual_end defaults to slot_expiry.
+def write_queue_meta(slot_expiry, actual_end = nil)
+  actual_end = slot_expiry if actual_end.nil?
   tmp = "#{QUEUE_META}.tmp"
   begin
-    File.write(tmp, epoch.to_i.to_s)
+    File.write(tmp, "#{slot_expiry.to_i} #{actual_end.to_i}")
     File.rename(tmp, QUEUE_META)
   rescue => e
     log("WARN: could not write queue expiry meta: #{e.message}; queue will persist until next overwrite")
@@ -276,23 +296,45 @@ def write_queue_meta(epoch)
   end
 end
 
-# Returns the queue expiry as a Time, or nil when no (valid) meta exists.
-def queue_expiry
-  return nil unless File.exist?(QUEUE_META)
-  raw = File.read(QUEUE_META).strip
-  if raw.match?(/\A\d+\z/)
-    Time.at(raw.to_i)
+# Parse one meta token: integer epoch or a parseable time string.
+def parse_meta_token(token)
+  if token.match?(/\A\d+\z/)
+    Time.at(token.to_i)
   else
-    Time.parse(raw)
+    Time.parse(token)
   end
+end
+
+# Returns [slot_expiry Time, actual_end Time], or [nil, nil] when no (valid)
+# meta exists. A legacy single-integer file (written by the scheduler before
+# the two-value format) carries NO duration evidence: actual_end reads as
+# epoch 0, which the shim guard treats as "unknown -- do not block". Every
+# fire under the current scheduler rewrites the meta in the two-value form.
+def queue_meta_times
+  return [nil, nil] unless File.exist?(QUEUE_META)
+  parts = File.read(QUEUE_META).strip.split(/\s+/)
+  slot   = parse_meta_token(parts[0])
+  actual = parts[1] ? parse_meta_token(parts[1]) : Time.at(0)
+  [slot, actual]
 rescue ArgumentError
-  nil
+  [nil, nil]
+end
+
+# Returns the queue slot expiry as a Time, or nil when no (valid) meta exists.
+def queue_expiry
+  queue_meta_times[0]
+end
+
+# Returns the queued item's real playing end as a Time, or nil when unknown.
+def queue_actual_end
+  queue_meta_times[1]
 end
 
 # Lazy expiry check, run at the top of every cron tick: if the queued item is
-# past its end time, clear the queue. station.liq's request.dynamic then goes
+# past its SLOT end, clear the queue. station.liq's request.dynamic then goes
 # fallible and the fallback drops back to background music within ~2s.
-# Worst-case overshoot is one cron minute.
+# Worst-case overshoot is one cron minute. (The shim guard reads actual_end,
+# not this -- a shim may cut in long before the slot expires.)
 def expire_queue_if_due(now)
   exp = queue_expiry
   return if exp.nil?
@@ -320,10 +362,24 @@ end
 # runlength_sec (from schedule.txt, when given) becomes the queue TTL so the
 # entry self-expires at the end of its slot; without one we cap at 4 hours so
 # even an unbounded show eventually hands back to background music.
-def fire_show(playable, runlength_sec = nil)
+# duration_sec (the episode's real duration from played.db, when known) is
+# recorded as the item's actual_end in QUEUE_META -- when it is expected to
+# STOP PLAYING. The slot end still governs queue clearing; the actual end is
+# what the shim guard reads, so a show that ends before its allotment stops
+# blocking shims at its real end rather than at the slot end.
+def fire_show(playable, runlength_sec = nil, duration_sec = nil)
   ttl = (runlength_sec && runlength_sec > 0) ? runlength_sec : 4 * 3600
-  write_uri_file(QUEUE_FILE, playable, ttl)
-  log("QUEUED show: #{playable} (expires in #{ttl}s)")
+  # Known duration: the item stops playing at fire + min(ttl, duration) --
+  # capped at the slot because an episode longer than its slot is cut by the
+  # runlength clamp there anyway, so the slot end IS its real playing end.
+  # Unknown duration: pass nil, so meta records actual_end == slot_expiry --
+  # the CONSERVATIVE reading. The shim then protects the entry until its slot
+  # ends instead of guessing that nothing is playing (a shim must never
+  # clobber a show that landed on time).
+  actual = (duration_sec && duration_sec.to_i > 0) ? [ttl, duration_sec.to_i].min : nil
+  write_uri_file(QUEUE_FILE, playable, ttl, actual)
+  plays = actual ? "~#{actual}s" : "unknown length, protected to slot end"
+  log("QUEUED show: #{playable} (expires in #{ttl}s, plays #{plays})")
 end
 
 # Build a deterministic capture path from the stream URL + fire time so we can
@@ -379,7 +435,10 @@ def fire_stream(url, runlength_sec = nil)
   if size > 0
     # TTL = capture length + 5 min slack: ffmpeg stops writing after dur, and
     # the queue self-clears shortly after the capture has finished playing.
-    write_uri_file(QUEUE_FILE, cap, dur + 300)
+    # actual_end = dur: the capture stops playing when ffmpeg stops writing,
+    # so a shim scheduled inside a stream slot can fill from the capture's
+    # real end (the 300s slack belongs to the slot, not to playback).
+    write_uri_file(QUEUE_FILE, cap, dur + 300, dur)
     log("QUEUED stream capture: #{cap} (size=#{size} bytes so far, expires in #{dur + 300}s)")
   else
     # ffmpeg wrote nothing within 5s -- clear the queue so background music
@@ -388,6 +447,61 @@ def fire_stream(url, runlength_sec = nil)
     clear_uri_file(QUEUE_FILE)
     ff_err = File.read("#{cap}.fflog") rescue "<no log>"
     log("ffmpeg stderr: #{ff_err.strip[0, 400]}")
+  end
+end
+
+# Fire a SHIM entry: like a show, but only when nothing is actually playing.
+# The guard reads the queue's actual_end (episode duration / capture length),
+# NOT the slot expiry: a show or stream inside its slot but already finished
+# does NOT block the shim -- that is the whole point (filler when a show ends
+# before its allotment). While the item is still actually playing the shim is
+# skipped and retried next minute (the caller does not mark the fire marker).
+#
+# Trust is decided at WRITE time, not read time. A trusted playing-end stamp
+# exists whenever the fired item's length was known (episode duration capped
+# at the slot, or capture length); the shim blocks while that stamp is in the
+# future. A stamp of epoch 0 means NO evidence -- only legacy single-integer
+# meta parses that way -- and never blocks, so pre-swap stale entries (e.g. a
+# dead URI with background music already airing) let the shim cut in. An
+# entry with unknown length records actual_end == slot_expiry, which the
+# guard honours: conservative protection, a shim must never clobber a show
+# that landed on time.
+#
+# When the shim fires over an entry whose slot is still open, its TTL is
+# capped at the remaining slot, so filler hands back to background music
+# exactly where the interrupted entry would have -- and chained shim fires
+# stay anchored to that same end, because each reads the already-capped meta.
+# With an empty queue the shim fires like a plain show (its own RUNLENGTH, or
+# the 4h cap when none is given).
+def fire_shim(entry)
+  queued = File.exist?(QUEUE_FILE) && !File.read(QUEUE_FILE).strip.empty?
+  if queued
+    act = queue_actual_end
+    if act && act.to_i > 0 && Time.now.to_i < act.to_i
+      log("SKIP shim '#{entry[:target]}': queued item still playing until #{act.strftime('%Y-%m-%d %H:%M:%S')}")
+      return false
+    end
+    exp = queue_expiry
+    remaining = exp && exp.to_i > Time.now.to_i ? exp.to_i - Time.now.to_i : nil
+    eff_runlength = entry[:runlength]
+    if remaining
+      eff_runlength = remaining if eff_runlength.nil? || eff_runlength <= 0 || eff_runlength > remaining
+    end
+    log("SHIM: slot open but item finished; filling remaining #{remaining.inspect}s")
+    uri, ep_dur = resolve_show(entry[:target])
+    if uri
+      fire_show(uri, eff_runlength, ep_dur)
+      return true
+    end
+    false
+  else
+    uri, ep_dur = resolve_show(entry[:target])
+    if uri
+      fire_show(uri, entry[:runlength], ep_dur)
+      true
+    else
+      false
+    end
   end
 end
 
@@ -423,12 +537,29 @@ def main
     slug = ARGV[1]
     raise ArgumentError, "--dryfire-show requires a slug" if slug.nil? || slug.empty?
     log("[dryfire] resolving show now: #{slug}")
-    uri = resolve_show(slug)
+    uri, ep_dur = resolve_show(slug)
     if uri
-      fire_show(uri)
+      fire_show(uri, nil, ep_dur)
       log("[dryfire] queued -- station.liq should pick it up on its next poll")
     else
       log("[dryfire] nothing queued (see WARN above); background music continues")
+    end
+    return
+  end
+
+  # Dev hook: --dryfire-shim SLUG [SECS] runs the exact fire_shim path a
+  # scheduled "shim" entry uses, but immediately. Run it with an empty queue to
+  # see the fire path; run it while a show is live to see the SKIP guard.
+  #   ./run_radio.sh scheduler.rb --dryfire-shim conservation_news 1800
+  if ARGV[0] == "--dryfire-shim"
+    slug = ARGV[1]
+    raise ArgumentError, "--dryfire-shim requires a slug" if slug.nil? || slug.empty?
+    log("[dryfire] running shim path now: #{slug}")
+    ok = fire_shim({ target: slug, runlength: ARGV[2]&.to_i, raw: "(dryfire-shim #{slug})" })
+    if ok
+      log("[dryfire] shim queued -- station.liq should pick it up on its next poll")
+    else
+      log("[dryfire] shim did not fire (see SKIP/WARN above)")
     end
     return
   end
@@ -466,15 +597,25 @@ def main
       fired_any = true
 
     when "show"
-      uri = resolve_show(entry[:target])
+      uri, ep_dur = resolve_show(entry[:target])
       if uri
-        fire_show(uri, entry[:runlength])
+        fire_show(uri, entry[:runlength], ep_dur)
         mark_fired(key)
         fired_any = true
       else
         # No playable episode right now; don't mark fired so we retry next
         # minute (fetch_podcasts may populate new episodes shortly).
         log("DEFERRED: no playable episode yet for '#{entry[:target]}', will retry next minute")
+      end
+
+    when "shim"
+      if fire_shim(entry)
+        mark_fired(key)
+        fired_any = true
+      else
+        # Not fired (queued item still actually playing, or nothing playable
+        # yet): don't mark, so the shim is re-evaluated on the next tick.
+        log("DEFERRED: shim '#{entry[:target]}' did not fire this tick, will retry next minute")
       end
     end
   end

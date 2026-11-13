@@ -8,9 +8,12 @@
 # 0 6 * * 1     stream  http://example.org:8000/live.mp3   3600
 # ################################################################### Daily
 # KOPB --> BBC News & Local (Midnight to 7am)
-0 0 * * 1-7    stream    http://stream1.opb.org/radio.mp3    25200
+0 0 * * 0,1,2,3,4,5,6    stream    http://stream1.opb.org/radio.mp3    25200
 # History of Rome (Noon to 1pm)
-0 12 * * 1-7    show    the_history_of_rome
+0 12 * * 0,1,2,3,4,5,6    show    the_history_of_rome
+# 30 12 * * 0,1,2,3,4,5,6	shim	conservation_news
+# 45 12 * * 0,1,2,3,4,5,6	shim	conservation_news
+
 # ################################################################### Weekdays
 # ############################################################# Morning
 # UpFront KPFA
@@ -19,9 +22,9 @@
 0 8 * * 1-5    show    the_bradcast_w_brad_friedman
 # Extinction Rebellion
 0 9 * * 1-5    show    extinction_rebellion_podcast
-15 9 * * 1-5	show	conservation_news	
-30 9 * * 1-5	show	conservation_news
-45 9 * * 1-5	show	conservation_news
+# 15 9 * * 1-5	shim	conservation_news	
+# 30 9 * * 1-5	shim	conservation_news
+# 45 9 * * 1-5	shim	conservation_news
 # Jacobin Radio (Two Hours)
 0 10 * * 1-5    show    jacobin_radio
 # CrazyTown
@@ -42,13 +45,14 @@
 0 18 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
 # ############################################################# Evening
 # Alternative Visions
-0 19 * * 1-5    show    alternative_visions
+0 19 * * 1-5    show    solarpunk_presents
 # EFF's Effector
 0 20 * * 1-5    show    effector
 # Energy Transition Show
 0 21 * * 1-5    show    the_energy_transition_show_with_chris_nelder
-# The Green Element
+# Sustainability Solved
 0 22 * * 1-5    show    sustainability_solved
+# 0 22 * * 1-5    show    conservation_news
 # History of Philosophy (Without any gaps)
 0 23 * * 1-5    show    history_of_philosophy_without_any_gaps
 # ################################################################### Saturday
@@ -86,31 +90,31 @@
 # ################################################################### Sunday
 # ############################################################# Morning
 # 21st Century Wire
-0 7 * * 7	show	21st_century_wire
+0 7 * * 0	show	21st_century_wire
 # 2 Skeptical Chaps (2 Hours)
-0 8 * * 7	show	2_skeptical_chaps
+0 8 * * 0	show	2_skeptical_chaps
 # Citizen Radio
-0 10 * * 7	show	citizen_radio
+0 10 * * 0	show	citizen_radio
 # Final Straw Radio
-0 11 * * 7	show	the_final_straw_radio
+0 11 * * 0	show	the_final_straw_radio
 # ############################################################# Afternoon
 # From What-if to What-next
-0 13 * * 7	show	from_what_if_to_what_next
+0 13 * * 0	show	from_what_if_to_what_next
 # Frontline Dispatch
-0 14 * * 7	show	the_frontline_dispatch
+0 14 * * 0	show	the_frontline_dispatch
 # Ralph Nader Radio Hour (2 Hours)
-0 15 * * 7	show	ralph_nader_radio_hour
+0 15 * * 0	show	ralph_nader_radio_hour
 # 
-0 17 * * 7	show	history_of_philosophy_india_africana_china
+0 17 * * 0	show	history_of_philosophy_india_africana_china
 # KPFA Evening News
-0 18 * * 7    stream    https://streams.kpfa.org:8443/kpfa    3600
+0 18 * * 0    stream    https://streams.kpfa.org:8443/kpfa    3600
 # Keeping Democracy Alive
-0 19 * * 7	show	keeping_democracy_alive_with_burt_cohen
+0 19 * * 0	show	keeping_democracy_alive_with_burt_cohen
 # Linux in the Ham Shack
-0 20 * * 7	show	linux_in_the_ham_shack
+0 20 * * 0	show	linux_in_the_ham_shack
 # MMT Podcast
-0 21 * * 7	show	the_mmt_podcast_with_patricia_pino_christian_reilly
+0 21 * * 0	show	the_mmt_podcast_with_patricia_pino_christian_reilly
 # Money on the Left
-0 22 * * 7	show	money_on_the_left
+0 22 * * 0	show	money_on_the_left
 # ############################################################# Evening
 # fin
