@@ -74,12 +74,21 @@ def ensure_schema
         title TEXT NOT NULL,
         feed_url TEXT NOT NULL,
         archive INTEGER DEFAULT 0,
+        episode_limit INTEGER DEFAULT 0,
         opml_import INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     })
     rescue Exception => the_error
     end
+  end
+
+  # Migration for databases created before the retention feature: add the
+  # per-show episode limit (0 = no limit). ALTER TABLE ... ADD COLUMN with a
+  # DEFAULT also sets existing rows to 0.
+  unless $db_s[:shows].columns.include?(:episode_limit)
+    $db_s.execute(%Q{ALTER TABLE shows ADD COLUMN episode_limit INTEGER DEFAULT 0})
+    log("Added shows.episode_limit column (default 0 = no limit)")
   end
 
   unless table_exists?($db_p, :episodes)
@@ -125,6 +134,121 @@ end
 
 def reset_show_episodes(show_guid)
   $db_p[:episodes].where(show_guid: show_guid).update(played: 0)
+end
+
+# Enforce one show's episode limit: keep the `limit` most recently RECORDED
+# episodes (created_at descending -- created_at is download/insert time), and
+# remove the rest from played.db and from disk. A file still referenced by any
+# queue file is skipped and left for a later pass, so a queued or on-air
+# episode is never deleted underneath liquidsoap.
+def prune_show_episodes(show, limit, dry_run)
+  show_guid = show[:guid]
+  total = $db_p[:episodes].where(show_guid: show_guid).count
+  excess = total - limit
+  return 0 if excess <= 0
+
+  keep_guids = $db_p[:episodes]
+                 .where(show_guid: show_guid)
+                 .order(Sequel.desc(:created_at), :guid)
+                 .limit(limit)
+                 .select_map(:guid)
+
+  # String.new, not "": the frozen_string_literal pragma freezes string
+  # literals, and queued_text is built by mutation (<<).
+  queued_text = String.new
+  # Guard both queue directories: the active scheduler writes current_queue.txt
+  # under "queues", while this script's QUEUE_DIR is "queue". A file referenced
+  # by either must not be deleted.
+  [QUEUE_DIR, File.join(STORAGE, "queues")].uniq.each do |qdir|
+    next unless Dir.exist?(qdir)
+    Dir.glob(File.join(qdir, "*.txt")).each do |qf|
+      begin
+        queued_text << File.read(qf) << "\n"
+      rescue Exception => the_error
+        log("WARN: prune could not read #{qf}: #{the_error.message}")
+      end
+    end
+  end
+
+  victims = $db_p[:episodes]
+              .where(show_guid: show_guid)
+              .exclude(guid: keep_guids)
+              .order(Sequel.desc(:created_at), :guid)
+              .all
+
+  deleted = 0
+  freed = 0
+  victims.each do |ep|
+    lp = ep[:local_path]
+    if lp && File.exist?(lp)
+      if queued_text.include?(lp)
+        log("PRUNE: #{show[:slug]} keeping queued episode: #{ep[:title]}")
+        next
+      end
+      unless dry_run
+        begin
+          File.delete(lp)
+        rescue Exception => the_error
+          log("ERROR: prune could not delete #{lp}: #{the_error.message}")
+          next
+        end
+      end
+      freed += ep[:file_size_bytes].to_i
+    end
+    unless dry_run
+      $db_p[:episodes].where(guid: ep[:guid]).delete
+    end
+    deleted += 1
+    where = lp ? lp : "(no local file)"
+    log("PRUNE: #{show[:slug]} #{dry_run ? 'would delete' : 'deleted'}: #{ep[:title]} (#{where})")
+  end
+
+  log("PRUNE: #{show[:slug]} limit=#{limit} total=#{total} #{dry_run ? 'would remove' : 'removed'} #{deleted}, #{freed} bytes #{dry_run ? 'would be ' : ''}freed")
+  deleted
+end
+
+def prune_all(dry_run)
+  pruned = 0
+  $db_s[:shows].all.each do |show|
+    limit = show[:episode_limit].to_i
+    next unless limit > 0
+    begin
+      pruned += prune_show_episodes(show, limit, dry_run)
+    rescue Exception => the_error
+      log("ERROR: prune failed for #{show[:slug]}: #{the_error.message}")
+    end
+  end
+  pruned
+end
+
+# --set-limit <slug> <n>: set a show's episode_limit. 0 (or any non-positive)
+# means no limit. Resolves the show by exact slug first, then by feed_url,
+# the same lookup process_show uses. Returns true when the update was made.
+def cmd_set_limit(target, raw)
+  unless target && raw
+    log("ERROR: Usage: update_playlists.rb --set-limit <slug> <n>   (0 = no limit)")
+    return false
+  end
+  unless raw.match?(/\A\d+\z/)
+    log("ERROR: episode limit must be a non-negative integer, got: #{raw}")
+    return false
+  end
+  val = raw.to_i
+
+  show = $db_s[:shows].where(slug: target).first
+  show ||= $db_s[:shows].where(feed_url: target).first
+  if show.nil?
+    log("ERROR: Show not found: #{target}")
+    return false
+  end
+
+  $db_s[:shows].where(guid: show[:guid]).update(episode_limit: val)
+  if val > 0
+    log("Episode limit for #{show[:slug]} set to #{val} (was #{show[:episode_limit]})")
+  else
+    log("Episode limit for #{show[:slug]} removed (0 = no limit, was #{show[:episode_limit]})")
+  end
+  true
 end
 
 def write_queue_file(filename, uris)
@@ -203,6 +327,28 @@ def main
   ensure_dirs
   ensure_schema
 
+  # Episode retention. Runs on every invocation for any show with a configured
+  # limit, so the cap holds without anyone remembering to run it. Flags:
+  #   --prune          prune only, then exit (no schedule processing)
+  #   --prune-dry-run  log what would be deleted, delete nothing
+  dry_run = ARGV.delete("--prune-dry-run") ? true : false
+  if ARGV.include?("--prune")
+    ARGV.delete("--prune")
+    prune_all(dry_run)
+    return
+  end
+
+  # --set-limit <slug> <n>: set a show's episode_limit (0 = no limit) and
+  # exit without processing the schedule or running the prune pass. Exit
+  # status 0 on success, 1 on any failure, so shell chains can detect errors.
+  if ARGV.include?("--set-limit")
+    idx = ARGV.index("--set-limit")
+    ok = cmd_set_limit(ARGV[idx + 1], ARGV[idx + 2])
+    exit(ok ? 0 : 1)
+  end
+
+  prune_all(dry_run)
+
   schedule = load_schedule
   if schedule.empty?
     log("No schedule entries found in #{SCHEDULE_FILE}")
@@ -250,7 +396,7 @@ def main
     $db_s[:shows].all.each do |show|
       total = $db_p[:episodes].where(show_guid: show[:guid]).count
       played = $db_p[:episodes].where(show_guid: show[:guid], played: 1).count
-      summary << {slug: show[:slug], title: show[:title], total: total, played: played, unplayed: total - played}
+      summary << {slug: show[:slug], title: show[:title], total: total, played: played, unplayed: total - played, limit: show[:episode_limit].to_i}
     end
     puts JSON.pretty_generate(summary)
   end

@@ -24,6 +24,11 @@ STORAGE     = CFG["storage"]
 STATE_DIR   = File.join(STORAGE, "state")
 LOGS_DIR    = File.join(STORAGE, "logs")
 PODCAST_DIR = File.join(STORAGE, "podcasts")
+# Queue directories checked by the retention prune before deleting a file:
+# the active scheduler reads current_queue.txt from "queues", while
+# update_playlists.rb has historically written per-show files under "queue".
+# Both are guarded so a queued or on-air episode is never deleted.
+QUEUE_DIRS  = [File.join(STORAGE, "queues"), File.join(STORAGE, "queue")].freeze
 SUBS_DB     = File.join(STATE_DIR, "subscriptions.db")
 PLAYED_DB   = File.join(STATE_DIR, "played.db")
 LOG_FILE    = File.join(LOGS_DIR, "fetch_podcasts.log")
@@ -82,12 +87,22 @@ def ensure_schema
         slug TEXT UNIQUE NOT NULL,
         title TEXT NOT NULL,
         feed_url TEXT NOT NULL,
+        episode_limit INTEGER DEFAULT 0,
         archive INTEGER DEFAULT 0,
         opml_import INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     ))
     log("INFO", "Created shows table in subscriptions.db")
+  end
+
+  # Migration for databases created before the retention feature: add the
+  # per-show episode limit (0 = no limit). ALTER TABLE ... ADD COLUMN with a
+  # DEFAULT also sets existing rows to 0. Skipped when the column already
+  # exists (installer-created schema, or update_playlists.rb got there first).
+  unless $db_s[:shows].columns.include?(:episode_limit)
+    $db_s.execute(%(ALTER TABLE shows ADD COLUMN episode_limit INTEGER DEFAULT 0))
+    log("INFO", "Added shows.episode_limit column (default 0 = no limit)")
   end
 
   unless table_count($db_p, "episodes")
@@ -106,6 +121,86 @@ def ensure_schema
     ))
     log("INFO", "Created episodes table in played.db")
   end
+end
+
+# --- Episode retention --------------------------------------------------------
+# Concatenated text of every queue file in both queue directories, used to
+# protect queued or on-air episodes from deletion.
+def queued_episode_paths
+  # String.new, not "": the frozen_string_literal pragma freezes string
+  # literals, and queued_text is built by mutation (<<). A frozen literal
+  # would raise FrozenError here, which the rescue below swallows, leaving
+  # the guard text empty and the protection inert.
+  queued_text = String.new
+  QUEUE_DIRS.each do |qdir|
+    next unless Dir.exist?(qdir)
+    Dir.glob(File.join(qdir, "*.txt")).each do |qf|
+      begin
+        queued_text << File.read(qf) << "\n"
+      rescue StandardError => e
+        log("WARN", "prune could not read #{qf}: #{e.class}: #{e.message}")
+      end
+    end
+  end
+  queued_text
+end
+
+# Enforce a show's episode_limit: keep the `limit` most recently RECORDED
+# episodes (created_at descending -- created_at is download/insert time) and
+# remove the rest from played.db and from disk. A file still referenced by any
+# queue file is skipped and left for a later pass, so a queued or on-air
+# episode is never deleted underneath liquidsoap. Mirrors the same-named
+# function in update_playlists.rb; the only difference is this file's
+# two-argument log(level, msg) and the QUEUE_DIRS guard list above.
+def prune_show_episodes(show, limit, dry_run)
+  show_guid = show[:guid]
+  total = $db_p[:episodes].where(show_guid: show_guid).count
+  excess = total - limit
+  return 0 if excess <= 0
+
+  keep_guids = $db_p[:episodes]
+                 .where(show_guid: show_guid)
+                 .order(Sequel.desc(:created_at), :guid)
+                 .limit(limit)
+                 .select_map(:guid)
+
+  queued_text = queued_episode_paths
+
+  victims = $db_p[:episodes]
+              .where(show_guid: show_guid)
+              .exclude(guid: keep_guids)
+              .order(Sequel.desc(:created_at), :guid)
+              .all
+
+  deleted = 0
+  freed = 0
+  victims.each do |ep|
+    lp = ep[:local_path]
+    if lp && File.exist?(lp)
+      if queued_text.include?(lp)
+        log("INFO", "PRUNE: #{show[:slug]} keeping queued episode: #{ep[:title]}")
+        next
+      end
+      unless dry_run
+        begin
+          File.delete(lp)
+        rescue Exception => error
+          log("ERROR", "prune could not delete #{lp}: #{error.class}: #{error.message}")
+          next
+        end
+      end
+      freed += ep[:file_size_bytes].to_i
+    end
+    unless dry_run
+      $db_p[:episodes].where(guid: ep[:guid]).delete
+    end
+    deleted += 1
+    where = lp ? lp : "(no local file)"
+    log("INFO", "PRUNE: #{show[:slug]} #{dry_run ? 'would delete' : 'deleted'}: #{ep[:title]} (#{where})")
+  end
+
+  log("INFO", "PRUNE: #{show[:slug]} limit=#{limit} total=#{total} #{dry_run ? 'would remove' : 'removed'} #{deleted}, #{freed} bytes #{dry_run ? 'would be ' : ''}freed")
+  deleted
 end
 
 def gen_guid(seed_str)
@@ -561,6 +656,14 @@ def cmd_fetch_all
     ensure_dir(show_dir)
 
     new_eps = 0
+    # Retention state for the admission cap (episode_limit 0 = no limit):
+    # recorded is the show's row count BEFORE this run, admitted counts the
+    # episodes this run is allowed to download, and queued_text is the
+    # queue-file guard text, built once per show.
+    limit = show[:episode_limit].to_i
+    recorded = limit > 0 ? $db_p[:episodes].where(show_guid: show[:guid]).count : 0
+    admitted = 0
+    queued_text = limit > 0 ? queued_episode_paths : ""
     parsed[:items].each do |ep|
       existing = $db_p[:episodes].where(guid: ep[:guid]).first
       if existing
@@ -569,11 +672,23 @@ def cmd_fetch_all
 
       filename = "#{safe_filename(ep[:guid])}.mp3"
       dest = File.join(show_dir, filename)
+
+      # Hard admission cap: a capped show admits at most limit - recorded
+      # episodes per fetch run. Feed items arrive newest-first, so a fill
+      # takes the newest ones; at the limit nothing is downloaded at all.
+      # Skipped items are not recorded, so they are not counted as failures
+      # and will simply be re-offered (and re-skipped) on later runs.
+      if limit > 0 && recorded + admitted >= limit
+        log("INFO", "CAP: #{show[:slug]} at episode limit #{limit}, skipping: #{ep[:title]}")
+        next
+      end
+
       dl_ok = http_stream_to_file(ep[:url], dest)
       unless dl_ok
         log("WARN", "Episode download failed for #{show[:slug]}: #{ep[:guid]}, not recorded -- will retry next fetch")
         next
       end
+
       size = File.size(dest)
 
       now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
@@ -588,9 +703,17 @@ def cmd_fetch_all
         file_size_bytes: size,
         created_at: now
       )
+      admitted += 1
       new_eps += 1
     end
     log("INFO", "#{show[:slug]}: #{new_eps} new episodes downloaded")
+    # Backstop prune: brings a show already over its episode_limit back down
+    # without downloading anything (for example after lowering the limit
+    # below an existing backfill). A show exactly at its limit admits nothing
+    # above, so it stays there. Runs even when new_eps is 0.
+    if limit > 0
+      prune_show_episodes(show, limit, false)
+    end
   end
 end
 

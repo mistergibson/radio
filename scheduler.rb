@@ -297,7 +297,10 @@ def write_queue_meta(slot_expiry, actual_end = nil)
 end
 
 # Parse one meta token: integer epoch or a parseable time string.
+# nil-safe: an empty meta file yields no tokens at all, and the caller passes
+# whatever parts[0] holds.
 def parse_meta_token(token)
+  return nil unless token
   if token.match?(/\A\d+\z/)
     Time.at(token.to_i)
   else
@@ -313,6 +316,7 @@ end
 def queue_meta_times
   return [nil, nil] unless File.exist?(QUEUE_META)
   parts = File.read(QUEUE_META).strip.split(/\s+/)
+  return [nil, nil] if parts.empty?
   slot   = parse_meta_token(parts[0])
   actual = parts[1] ? parse_meta_token(parts[1]) : Time.at(0)
   [slot, actual]

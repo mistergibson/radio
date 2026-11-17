@@ -21,7 +21,7 @@
 # Bradcast
 0 8 * * 1-5    show    the_bradcast_w_brad_friedman
 # Extinction Rebellion
-0 9 * * 1-5    show    extinction_rebellion_podcast
+0 9 * * 1-5    show    conservation_news
 # 15 9 * * 1-5	shim	conservation_news	
 # 30 9 * * 1-5	shim	conservation_news
 # 45 9 * * 1-5	shim	conservation_news
@@ -37,6 +37,7 @@
 0 14 * * 1-5    show    the_appeal
 # Revolutions
 0 15 * * 1-5    show    revolutions
+30 15 * * 1-5	shim	conservation_news
 # Hardknock Radio KPFA
 0 16 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
 # Flashpoints KPFA
@@ -44,14 +45,15 @@
 # Evening News KPFA
 0 18 * * 1-5    stream    https://streams.kpfa.org:8443/kpfa    3600
 # ############################################################# Evening
-# Alternative Visions
+# SolarPunk Presents 
 0 19 * * 1-5    show    solarpunk_presents
+30 19 * * 1-5	shim	conservation_news
 # EFF's Effector
 0 20 * * 1-5    show    effector
 # Energy Transition Show
 0 21 * * 1-5    show    the_energy_transition_show_with_chris_nelder
 # Sustainability Solved
-0 22 * * 1-5    show    sustainability_solved
+0 22 * * 1-5    show    extinction_rebellion_podcast
 # 0 22 * * 1-5    show    conservation_news
 # History of Philosophy (Without any gaps)
 0 23 * * 1-5    show    history_of_philosophy_without_any_gaps
@@ -79,8 +81,9 @@
 # ############################################################# Evening
 # Evening News KPFA
 0 18 * * 6	stream	https://streams.kpfa.org:8443/kpfa	3600
-# The Dollop
-0 19 * * 6	show	the_dollop_with_dave_anthony_and_gareth_reynolds
+# 1 Hour Open
+0 19 * * 6  show    conservation_news
+30 19 * * 6 show    conservation_news
 # Common Censored
 0 20 * * 6	show	common_censored
 # Clearing The Fog
