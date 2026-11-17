@@ -65,7 +65,7 @@ The key design decision: **liquidsoap never relays a live Icecast mount directly
 | `station.liq` | The Liquidsoap config: queue-reading `request.dynamic`, poller, fallback mux, background music, Icecast output (plain HTTP or TLS per `config.json`). |
 | `scheduler.rb` | The clock. Run from cron every minute; matches `schedule.txt` against the current time and writes the due URI into the queue file. Includes three dry-fire dev hooks. |
 | `fetch_podcasts.rb` | Podcast ingestion: add/remove/archive shows, import OPML, download new episodes (bounded by each show's `episode_limit`), sync with a gPodder server. |
-| `update_playlists.rb` | Legacy playlist writer (its per-show files under `storage/queue/` are not in the air path) **and** the control panel for per-show episode retention: `--set-limit`, `--prune`, `--prune-dry-run`, plus the `--json` inventory report. Its prune pass runs from cron at :30. |
+| `update_playlists.rb` | Legacy playlist writer (its per-show files under `storage/queue/` are not in the air path) **and** the control panel for per-show episode retention: `--set-limit`, `--prune`, `--prune-dry-run`, plus the `--json` inventory report and the `--export` OPML subscription list. Its prune pass runs from cron at :30. |
 | `run_radio.sh` | Launcher for every JRuby script: sets the gem environment and JVM heap, then `exec`s jruby. |
 | `console.sh` | Interactive `jirb` console with the same gem environment, running as the `liquidsoap` user. |
 | `install_for_jruby` | One-shot installer: gems, databases, `config.json`, systemd unit, cron entries. |
@@ -235,7 +235,7 @@ fetch_podcasts.rb [--list|--detail|--add-show <url>|--remove <slug>|--archive <s
 | `--remove <slug>` | Remove a show, matched by case-insensitive substring against slugs or by exact feed URL. Deletes its episodes from `played.db`, then the show itself. |
 | `--archive <slug>` | Mark a show archived. Only archived shows are fetched by `--fetch-all` and only archived shows are eligible for scheduled `show` slots' reset cycle. |
 | `--unarchive <slug>` | Clear the archive flag. |
-| `--import-opml <file>` | Import subscriptions from a local OPML file. Each imported show is marked archived and flagged as OPML-imported. |
+| `--import-opml <file>` | Import subscriptions from a local OPML file. Each imported show is marked archived and flagged as OPML-imported. The inverse operation is `update_playlists.rb --export`. |
 | `--fetch-all` | Fetch every **archived** show: read its feed, download new episodes into `<storage>/podcasts/<slug>/`, and record each in `played.db` with duration, size, and local path. Episodes already known (by GUID) are skipped. This is the cron-installed hourly command. A show with `episode_limit > 0` is subject to the **admission cap**: each run downloads at most `limit - recorded` new episodes for it, and at the cap it downloads nothing at all (`CAP:` log lines). Feed items arrive newest-first, so a fill takes the newest episodes. Skipped items are not recorded as failures; they are simply re-offered on later runs. After the item loop a backstop prune trims a show already over its limit without downloading anything (for example after the limit was lowered below an existing backfill). |
 | *(no arguments)* | Prints the usage line (after the gPodder sync attempt). |
 
@@ -254,6 +254,7 @@ On each invocation, in order: `--prune` (prune only, then exit), `--set-limit` (
 | `--prune` | Run the retention prune pass only, then exit (no schedule processing). |
 | `--prune-dry-run` | Make the prune pass a dry run: logs `would delete` per episode and a summary with the bytes that would be freed, deletes nothing. Combine with `--prune` for a prune-only dry run. |
 | `--json` | Additionally print a JSON summary of every registered show: slug, title, total/played/unplayed episode counts, and `limit`. Useful for monitoring scripts. |
+| `--export <file.opml>` | Write every registered show as a standard OPML 2.0 subscription list, ordered by slug, and exit without processing the schedule or pruning. Each show becomes one `<outline type="rss" text="..." title="..." xmlUrl="..."/>` -- exactly the attributes `fetch_podcasts.rb --import-opml` reads, so an export re-imports cleanly into this stack or any gPodder-compatible reader. Titles and feed URLs are XML-attribute-escaped. Exit status 0 on success, 1 on failure (missing argument, empty registry, unwritable path). The file is written by the `liquidsoap` user, so the target path must be writable by that user. |
 
 The prune pass keeps each capped show's `limit` most recently **recorded** episodes (`created_at` is download/insert order, not publish date, so a backfill inserted newest-first keeps the oldest-published episodes -- worth knowing when a show was backfilled). Every deletion is logged as `PRUNE: <slug> deleted: <title> (<path>)` with a summary line giving the count and bytes freed. A file still referenced by any `*.txt` queue file under either `storage/queue/` or `storage/queues/` is skipped and left for a later pass, so a queued or on-air episode is never deleted underneath liquidsoap (`PRUNE: <slug> keeping queued episode: ...`).
 
@@ -356,6 +357,7 @@ The Liquidsoap config is extensively commented in the file itself; the load-bear
 - Episode inventory as JSON (includes each show's `limit`): `./run_radio.sh update_playlists.rb --json`.
 - Cap a show: `./run_radio.sh update_playlists.rb --set-limit <slug> 12` (0 = no limit).
 - Preview retention deletions: `./run_radio.sh update_playlists.rb --prune --prune-dry-run`.
+- Export the registry as OPML: `./run_radio.sh update_playlists.rb --export <file.opml>` (path must be writable by the `liquidsoap` user).
 
 **Housekeeping is automatic.** Fire markers older than one day and captures older than two days are pruned each scheduler tick. A capture's `.fflog` is ffmpeg's stderr for that capture, next to the MP3. Episode retention is automatic for capped shows: the hourly fetch admits up to each show's cap and the :30 prune pass trims anything over it.
 

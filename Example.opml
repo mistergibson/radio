@@ -1,124 +1,53 @@
-<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
-    <head>
-        <title>gPodder subscriptions</title>
-        <dateCreated>Fri, 23 Oct 2026 12:00:03 -0700</dateCreated>
-    </head>
-    <body>
-        <outline title="Tech Hygiene" text="&lt;div&gt;A podcast about staying clean (and sane) in a crazy digital world. Hosted by Loren Feldman and John Biggs.&lt;/div&gt;" xmlUrl="https://audioboom.com/channels/4933416.rss" type="rss"/>
-        <outline title="Common Censored" text="With Lee Camp and Eleanor Goldfield. 
-
-Censored stories, sensible solutions and common ground movements to fight and build.
-And sometimes other stuff too.
-
-leecamp.com
-artkillingapathy.com" xmlUrl="https://commoncensored.libsyn.com/rss" type="rss"/>
-        <outline title="Peter B. Collins" text="News and Politics from the Left Coast" xmlUrl="https://www.peterbcollins.com/feed/" type="rss"/>
-        <outline title="CounterSpin" text="CounterSpin is the weekly radio show of FAIR, the national media watch group." xmlUrl="https://fair.org/feed/podcast/" type="rss"/>
-        <outline title="Eyes Left Podcast" text="EYES LEFT is a socialist, anti-war military podcast hosted by veterans." xmlUrl="https://anchor.fm/s/553460c/podcast/rss" type="rss"/>
-        <outline title="Citizen Radio" text="Citizen Radio is hosted by Allison Kilkenny and is dedicated to covering the stories that the mainstream, corporate media ignores. 
-&lt;br&gt;&lt;br&gt;
-It's like Democracy Now but with much more swearing. 
-&lt;br /&gt;
-They have interviewed such distinct intellectuals, bands, and comics such as Noam Chomsky, Ralph Nader, Rachel Maddow, Melissa Harris-Perry, Tariq Ali, Howard Zinn, Matt Taibbi, Rise Against, System of a Down, Anti-Flag, Bad Religion, Jeremy Scahill, Robin Williams, Matt Besser, Janeane Garofalo, and more. 
-&lt;br /&gt;
-&quot;[Citizen Radio] has created an important political radio show that balances humor and unreported news. At a time when media conglomerates dominate the airwaves, independent media like Citizen Radio is vital to national discourse&quot;
-- Noam Chomsky
-&lt;br /&gt;
-&quot;Allison Kilkenny strikes fear into the hearts of corrupt politicians and corporations everywhere&quot;
--Village Voice
-&lt;br /&gt;
-&quot;Kilkenny is one of the top 30 media heroes in the country&quot; 
--The Nation
-&lt;br /&gt;
-&quot;Allison Kilkenny is this generation's Amy Goodman&quot; 
--Melissa Harris-Perry.
-&lt;br /&gt;
-&quot;Allison Kilkenny's writing makes me want to vomit&quot;
-- G. Gordon Liddy, Convicted Watergate criminal
-&lt;br /&gt;
-&quot;Jamie Kilstein is a doofus.&quot; –Glenn Beck" xmlUrl="http://feeds.feedburner.com/CitizenRadio" type="rss"/>
-        <outline title="AlternativeRadio" text="Alternative Radio is an &quot;unembedded&quot; weekly one-hour public affairs program offered free to all public radio stations in the US, Canada, Europe, South Africa, Australia, and on short-wave on Radio for Peace International. AR provides information, analyses and views that are frequently ignored or distorted in other media. Visit alternativeradio.org for the complete catalog." xmlUrl="https://www.alternativeradio.org/arpodcast.xml" type="rss"/>
-        <outline title="Conservation news" text="Environmental science and conservation news" xmlUrl="https://news.mongabay.com/feed/?post_type=post" type="rss"/>
-        <outline title="Revolutions" text="Season 12 premiered October 20, 2024 – a nonfictional account of The Martian Revolution of 2247.
-
-Mike Duncan is taking everything he's learned from 12 seasons of historical revolutions - the repeating arcs, characters, ideas, events, and patterns which all revolutions seem to follow - and created a fictional history of the Martian Revolution of 2247. The series is written from the point of view of a historian working hundreds of years after the Martian Revolution and will be presented in the style and format of previous seasons of Revolutions. It will look, sound, and feel like a Mike Duncan history podcast…but will instead be a fictional narrative of a gripping science-fiction epic.
-
-Revolutions is a podcast that covers the great political revolutions that have defined the modern world. Each season is a long-form narrative covering a different defining revolutionary epoch across three hundred years of history. It explores in great detail the people, ideas, and events that challenged and toppled outdated regimes and replaced them with new governments. After more than 350 episodes over ten seasons of narrative nonfiction, the 12th season is a fictional account of the Martian Revolution of 2247.
-
-*BREAKING NEWS*
-In the fall of 2025, the Revolutions podcast will return to its roots by diving into the great revolutions of the 20th century. The new run of episodes begins with the story of Irish Independence, a dramatic upheaval in the wake of WWI that saw Ireland free itself from centuries of English rule. Full of inspiring personalities, tragic events, and thrilling triumphs, Irish Independence is one of the most gripping events in revolutionary history. Future seasons will plunge ahead through the turbulent 20th century, and include the Spanish Civil War, the Cuban Revolution, and the Algerian War of Independence." xmlUrl="https://revolutionspodcast.libsyn.com/rss" type="rss"/>
-        <outline title="Clear and Present Danger - A history of free speech" text="Why have kings, emperors, and governments killed and imprisoned people to shut them up? And why have countless people risked death and imprisonment to express their beliefs? Jacob Mchangama guides you through the history of free speech from the trial of Socrates to the Great Firewall.
-Stay up to date with Clear and Present Danger on the show's website at freespeechhistory.com" xmlUrl="https://freespeechhistory.libsyn.com/rss" type="rss"/>
-        <outline title="The British History Podcast" text="The BHP is a chronological retelling of the history of Britain with a particular focus upon the lives of the people. You won’t find a dry recounting of dates and battles here, but instead you’ll learn about who these people were and how their desires, fears, and flaws shaped the scope of this island at the edge of the world. And some of those desires are downright scandalous." xmlUrl="https://feeds.feedburner.com/TheBritishHistoryPodcast" type="rss"/>
-        <outline title="History of Philosophy Without Any Gaps" text="Peter Adamson, Professor of Philosophy at the LMU in Munich and at King's College London, takes listeners through the history of philosophy, &quot;without any gaps&quot;. www.historyofphilosophy.net" xmlUrl="http://hopwag.podbean.com/feed" type="rss"/>
-        <outline title="Jacobin Radio" text="News, politics, history and more from Jacobin. Featuring The Dig, Long Reads, Confronting Capitalism, Behind the News, Jacobin Radio with Suzi Weissman, and occasional specials." xmlUrl="https://pinecast.com/feed/jacobin" type="rss"/>
-        <outline title="Alternative Visions" text="Dr. Jack Rasmus will focus on today’s continuing crisis in the U.S. and global economies." xmlUrl="http://alternativevisions.podbean.com/feed/" type="rss"/>
-        <outline title="Ashes Ashes" text="Ashes Ashes is a podcast about the end of the world. Each week we explore a new systemic or apocalyptic issue that society is facing now or will have to deal with in the coming decades. Through this we hope to draw the listener to the conclusion that our overarching economic and political systems are inherently flawed. Once that fact is accepted, it's that much easier to do something about it.
-
-Find episodes, full transcripts, links, and more at https://ashesashes.org." xmlUrl="https://pinecast.com/feed/ashes-ashes" type="rss"/>
-        <outline title="OFF-KILTER with Rebecca Vallas" text="Off-Kilter is a podcast about economic liberation—and the shifts in collective consciousness it will take to set us all free. 
-
-Every week, Rebecca Vallas talks with visionary leaders and organizations working to reinvigorate our shared imagination and disrupt the imbalance of power in our society.
-
-Find Off-Kilter on the Progressive Voices Network, the We Act Radio network in D.C., local radio stations across the U.S., and wherever you get your podcasts." xmlUrl="https://off-kilter.libsyn.com/rss" type="rss"/>
-        <outline title="The Dollop with Dave Anthony and Gareth Reynolds" text="&lt;p&gt;Comedians Dave Anthony and Gareth Reynolds picks a subject from history and examine it&lt;/p&gt;" xmlUrl="https://rss.art19.com/dollop" type="rss"/>
-        <outline title="RADIO ECOSHOCK - CD Quality Feed" text="Radio Ecoshock weekly 1 hour 56MB (Stereo mp3) program featuring the latest science, authors, issues - from climate change, oceans, forests, pollution, Peak Oil, the economy, and peace." xmlUrl="http://www.ecoshock.org/feed/cdquality" type="rss"/>
-        <outline title="The Bottom Line" text="Hosted by the Drucker Institute's Rick Wartzman, author of four books and a Fortune contributor, The Bottom Line puts a spotlight on companies that are advancing social progress—and those that aren't." xmlUrl="https://thebottomlinepodcast.libsyn.com/rss" type="rss"/>
-        <outline title="The History of Rome" text="A weekly podcast tracing the rise, decline and fall of the Roman Empire. Now complete!" xmlUrl="http://feeds.feedburner.com/TheHistoryOfRome" type="rss"/>
-        <outline title="History of Indian and Africana Philosophy" text="Peter Adamson teams up with Jonardon Ganeri, Chike Jeffers, and Karyn Lai to represent the philosophical traditions of ancient India, Africa and the African diaspora, and classical China. Website: www.historyofphilosophy.net." xmlUrl="https://hopwag2.podbean.com/feed/" type="rss"/>
-        <outline title="Escape Pod" text="The Original Science Fiction Podcast" xmlUrl="https://escapepod.org/feed/" type="rss"/>
-        <outline title="Open Source with Christopher Lydon" text="Christopher Lydon in conversation on arts, ideas and politics" xmlUrl="https://radioopensource.org/feed/" type="rss"/>
-        <outline title="Thinking Allowed" text="&lt;p&gt;New research on how society works&lt;/p&gt;" xmlUrl="http://podcasts.files.bbci.co.uk/b006qy05.rss" type="rss"/>
-        <outline title="The Energy Gang" text="&lt;p&gt;Covering breaking news in clean&amp;nbsp;tech, going deep on global energy policy, and debating the levers that need to move to accelerate the energy transition. &lt;em&gt;Energy Gang &lt;/em&gt;is the podcast covering clean energy&amp;nbsp;technology, renewable energy, and the environment. The world of clean energy moves fast,&amp;nbsp;and you need a reliable source to stay on top of the news that matters. You’ll find it on Wood Mackenzie’s &lt;em&gt;Energy Gang&lt;/em&gt;.&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;How will changes to the US government affect decarbonisation and energy security? When will hydrogen, nuclear and carbon capture deploy at scale? Where’s the money for the energy transition&amp;nbsp;green finance&amp;nbsp;coming from and how much more is needed? What’s the outlook for EVs? What are the energy predictions&amp;nbsp;for solar energy? What's the latest on climate change?&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;Get answers to questions like these, bi-weekly on Tuesdays at 7am ET. Plus, get special live episodes recorded at the biggest climate and energy events throughout the year, like COP30 and Climate Week NYC. Don’t worry if you can’t make it in person, &lt;em&gt;Energy Gang&lt;/em&gt;&amp;nbsp;brings you all the updates on energy policy, energy finance and energy&amp;nbsp;innovation you need to hear.&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;&lt;em&gt;Energy Gang&lt;/em&gt;&amp;nbsp;is presented by Wood Mackenzie and hosted by Ed Crooks, Vice-Chairman of Energy at Wood Mackenzie and a former Financial Times and BBC News journalist. Regular guests are Amy Myers-Jaffe (Director of NYU’s Energy, Climate Justice and Sustainability Lab), and Dr Melissa Lott (Partner at Microsoft) – plus a roster of industry leaders and policy influencers, like Jigar Shah (Industry figurehead and former director of the Loan Programs Office in the US Department of Energy), Caroline Golin (Head of North America, Global Energy Market Development and Policy at Google) and Ambassador Geoffrey Pyatt (Former Assistant Secretary of State for Energy Resources).&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;If you like &lt;em&gt;The Energy Transition Show&lt;/em&gt;, &lt;em&gt;Catalyst&lt;/em&gt;&amp;nbsp;with Shayle Kann, &lt;em&gt;The Big Switch&lt;/em&gt;&amp;nbsp;from Columbia University, &lt;em&gt;Open Circuit&lt;/em&gt;&amp;nbsp;with Stephen Lacey or &lt;em&gt;The Green Blueprint&lt;/em&gt;, you’ll enjoy &lt;em&gt;Energy Gang.&lt;/em&gt;&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;Want to get involved with the show? Reach out to &lt;a href=&quot;mailto:podcasts@woodmac.com&quot; rel=&quot;noopener noreferrer&quot; target=&quot;_blank&quot;&gt;podcasts@woodmac.com&lt;/a&gt; to:&lt;/p&gt;&lt;p&gt;Bring Energy Gang to your event&lt;/p&gt;&lt;p&gt;Be a guest on the show&lt;/p&gt;&lt;p&gt;Sponsor an episode&lt;/p&gt;&lt;p&gt;Ask a question to Ed Crooks or one of our guests&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;Check out another leading clean tech global podcast by Wood Mackenzie, Interchange Recharged: &lt;a href=&quot;https://www.woodmac.com/podcasts/the-interchange-recharged/&quot; rel=&quot;noopener noreferrer&quot; target=&quot;_blank&quot;&gt;https://www.woodmac.com/podcasts/the-interchange-recharged/&lt;/a&gt;&lt;/p&gt;&lt;p&gt;Wood Mackenzie is the leading global data and analytics solutions provider for renewables, energy and natural resources. Learn more about Wood Mackenzie on the official website: &lt;a href=&quot;https://www.woodmac.com/&quot; rel=&quot;noopener noreferrer&quot; target=&quot;_blank&quot;&gt;https://www.woodmac.com/&lt;/a&gt;&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;" xmlUrl="https://rss.art19.com/the-energy-gang" type="rss"/>
-        <outline title="Linux Outlaws" text="New media, new rules" xmlUrl="http://feeds.feedburner.com/linuxoutlaws" type="rss"/>
-        <outline title="Talk Nation Radio" text="http://davidswanson.org/about" xmlUrl="https://feeds.soundcloud.com/users/soundcloud%3Ausers%3A42346199/sounds.rss" type="rss"/>
-        <outline title="The Appeal" text="The Appeal is a podcast, hosted by Adam Johnson, on criminal justice reform, abolition and everything in between. Each week we will feature fascinating interviews with those covering, working in, and most affected by the American criminal system; from lawyers to activists to reporters to the formerly incarcerated. The Appeal will unpack the latest efforts to shine a light on––and radically rethink––the largest prison state in the world." xmlUrl="https://theappealpodcast.libsyn.com/rss" type="rss"/>
-        <outline title="Crazy Town" text="With equal parts humor and in-depth analysis, Asher, Rob, and Jason safeguard their sanity while probing crazy-making topics like climate change, overshoot, runaway capitalism, and why we’re all deluding ourselves. Each fortnightly episode helps you understand the “Great Unraveling” of our environmental and social systems and describes how we can make the transition to a sustainable and equitable world. If you’re someone who questions the trajectory of society and struggles to understand why most people would rather eat nachos on the deck of the “SS Denial” than face reality, you’ll find community and plenty of laughs in Crazy Town.
-
-
-Brought to you by https://www.resilience.org/ and the unconventional minds at Post Carbon Institute, a nonprofit think tank that builds awareness of the polycrisis and prescribes community resilience-building as the most appropriate response.
-
-
-Your hosts:
-Asher Miller - Nonprofit executive director by day, apocalypse comedian by night. Feels most at home exploring insanity-inducing topics while trying not to spill coffee on his keyboard as he convulses over the latest ecomodernist fantasy. In danger of losing his mind every time he encounters someone using a gas-powered blower to move leaves from one spot to another.
-
-
-Rob Dietz - Jack-of-all-trades environmental scientist, conservation biologist, and ecological economist with a penchant for relating planetary overshoot to the catalog of movie scenes that play on a continuous loop in his colonized brain. Known for inserting random ecological facts into casual conversation, often in Arnold Schwarzenegger’s voice. His friends call him “pessimistically hilarious.”
-
-
-Jason Bradford - Activist farmer and former encyclopedia salesman with a PhD in plant ecology who gets genuinely excited discussing soil microbes and societal collapse in the same breath. Morally opposed to doomsday prepping, but predisposed toward sharing everything he keeps in his bunker, er root cellar, including potatoes, wine, and a 47-month supply of scientific esoterica and embarrassing anecdotes.
-
-
-These guys are the Three Stooges of sustainability podcasting, although they tend toward scientific analysis, righteous outrage, and self-deprecation rather than beating each other up with hand tools. How can they have this much fun while contemplating collapse and navigating the Great Unraveling?
-
-
-Heartfelt thanks to the team at Post Carbon Institute, our volunteers, and all our fellow Crazy Townies out there who help bring this podcast to life." xmlUrl="https://feeds.captivate.fm/crazy-town/" type="rss"/>
-        <outline title="The Long Now Blog" text="" xmlUrl="http://feeds.feedburner.com/longnow" type="rss"/>
-        <outline title="Team Human" text="&lt;p&gt;Douglas Rushkoff sits down with scientists, activists, artists, philosophers, and researchers asking the same question: who actually benefits from the way we&amp;#39;ve built this world — and what do we do about it? Team Human is a weekly podcast about technology, power, consciousness, and what it means to stay human in a world that increasingly doesn&amp;#39;t seem designed for us. No corporate backing. No network. No algorithm deciding what gets said. Just honest, rigorous conversation with people working at the edges of the most important questions of our time. &lt;/p&gt;" xmlUrl="https://feeds.redcircle.com/3d87dea6-3d7d-4d94-b02e-9eb931541da8" type="rss"/>
-        <outline title="The Next System Podcast" text="The Next System Podcast is a regular series that examines the systemic challenges facing society today and the bold, systemic solutions that can build the society of tomorrow. Learn more about the Next System Project at www.thenextsystem.org." xmlUrl="https://nextsystem.libsyn.com/rss" type="rss"/>
-        <outline title="News Beat" text="A social justice podcast combining hard-hitting journalism and interviews with hip-hop music and original lyrics from independent artists. Each episode delves into an important issue with an alternative take to widely accepted narratives, arming listeners with knowledge and insight they won't hear from mainstream media outlets." xmlUrl="https://www.omnycontent.com/d/playlist/ed1c4567-4a2a-4d8b-862f-ab600003d530/24e95e5d-204a-4bdf-bbf8-ab6f016788ff/9b234dab-0449-442c-9203-ab6f01678903/podcast.rss" type="rss"/>
-        <outline title="Upstream" text="Conversations and audio documentaries exploring a wide variety of themes pertaining to economics and politics, hosted by Della Z Duncan and Robert R. Raymond" xmlUrl="https://feeds.libsyn.com/435210/rss" type="rss"/>
-        <outline title="Clearing the FOG with co-hosts Margaret Flowers and Kevin Zeese" text="Clearing the FOG: Speaking truth to expose the forces of greed on WeAct Radio, 1480 am, out of Anacostia, Washington, DC. The ruling FOG (Forces of Greed) spin news stories in their favor and keep the masses distracted with celebrity gossip and reality shows. Each week we feature guests who are working to expose the truth and offer real solutions to the current crises faced by our nation and the world. Knowledge is power, and with this knowledge you will be empowered to act to shift power to the people and weaken the corporate stranglehold on our lives. Together, we will clear the FOG and bring a new day of peace, justice and sustainability. WeAct Radio: Do something!" xmlUrl="https://clearingthefogradioshow.libsyn.com/rss" type="rss"/>
-        <outline title="Revolutionary Left Radio" text="Discussing political philosophy, current events, activism, and the inevitable historical downfall of capitalism from a revolutionary leftist perspective." xmlUrl="https://revolutionaryleftradio.libsyn.com/rss" type="rss"/>
-        <outline title="Money on the Left" text="&lt;p&gt;Welcome to the podcast feed of the &lt;b&gt;Money on the Left Editorial Collective&lt;/b&gt;. We are an interdisciplinary platform that reclaims money’s public powers for intersectional politics, drawing on Modern Monetary Theory and constitutional approaches to money to forge new paths for left critique and practice.&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;This feed serves as the single audio home for all Collective programming, bringing you regular interviews, political economy analysis, and special series on culture and aesthetics—including &lt;em&gt;Money on the Left&lt;/em&gt;, &lt;em&gt;In the Loop&lt;/em&gt;, and &lt;em&gt;Superstructure&lt;/em&gt;.&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;Presented in partnership with &lt;em&gt;Monthly Review&lt;/em&gt;.&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;Check out our website: https://moneyontheleft.org&lt;/p&gt;&lt;p&gt;&lt;br&gt;&lt;/p&gt;&lt;p&gt;Follow us on Bluesky @moneyontheleft.bsky.social &amp;amp; Facebook at @moneyontheleft.&amp;nbsp;&lt;/p&gt;" xmlUrl="https://rss.buzzsprout.com/172776.rss" type="rss"/>
-        <outline title="The Green Element: Sustainable Business Podcast" text="Making your organisation sustainable doesn't have to be complicated... Learn the proven strategies that transformed ordinary businesses into sustainability leaders, and how to implement them in your organisation today.
-
-Struggling to make your organisation more sustainable without sacrificing business performance? Each month on Sustainability Solved, Will Richardson &amp; Charlie Luxton unpack how leading companies are cracking the sustainability puzzle - and extract the strategies you can actually use, regardless of your industry. We dive deep into real success stories, breaking down exactly how organisations overcame common sustainability challenges, from supply chain emissions to waste reduction. Through candid conversations with leaders who've been there, you'll get battle-tested approaches, practical frameworks, and actionable insights you can implement today. Whether you're just starting your sustainability journey or looking to accelerate progress, each episode gives you concrete tools to drive meaningful change while strengthening your business. 
-
-Ready to turn sustainability from a challenge into competitive advantage?" xmlUrl="https://feeds.captivate.fm/sustainabilitysolvedpodcast/" type="rss"/>
-        <outline title="Norman Centuries | A Norman History Podcast by Lars Brownworth" text="Lars Brownworth, author of &quot;Lost to the West&quot; and creator of the &quot;12 Byzantine Rulers&quot; podcast presents &quot;Norman Centuries&quot;, a podcast on the Normans. While popular Norman history focuses on the regions of France and England, Norman Centuries covers the lesser known Italian Normans as well. Visit us at http://NormanCenturies.com/" xmlUrl="https://normancenturies.com/rss.xml" type="rss"/>
-        <outline title="12 Byzantine Rulers: The History of The Byzantine Empire" text="This lecture series by Lars Brownworth covers the history of the Byzantine Empire through the study of 12 of its greatest rulers." xmlUrl="https://12byzantinerulers.com/rss.xml" type="rss"/>
-        <outline title="The Energy Transition Show with Chris Nelder" text="Straight talk about the world’s transition from fossil fuels to renewables with energy expert Chris Nelder" xmlUrl="https://xenetwork.org/ets/feed/podcast" type="rss"/>
-        <outline title="Sean Carroll's Mindscape: Science, Society, Philosophy, Culture, Arts, and Ideas" text="Ever wanted to know how music affects your brain, what quantum mechanics really is, or how black holes work? Do you wonder why you get emotional each time you see a certain movie, or how on earth video games are designed? Then you've come to the right place. Each week, Sean Carroll will host conversations with some of the most interesting thinkers in the world. From neuroscientists and engineers to authors and television producers, Sean and his guests talk about the biggest ideas in science, philosophy, culture and much more." xmlUrl="https://feeds.libsyn.com/604590/rss" type="rss"/>
-        <outline title="The Undark Podcast" text="After a two-year hiatus, the Undark podcast returns with a new format and a new name: Entanglements. Join science journalists Brooke Borel and Anna Rothschild as they invite guests with both expertise and divergent opinions on some of the most contentious and politicized areas of science today, from vaccines and GMOs to deep sea mining, AI, and the origins of Covid. Their goal: To see if they can break through the discord and find common ground. Far from an exercise in false balance, Entanglements, like Undark, seeks to bring civil discussion — and a bit of fun and wonder — back to the intersection of science and culture." xmlUrl="https://feed.podbean.com/undarkpodcast/feed.xml" type="rss"/>
-        <outline title="The MMT Podcast with Patricia Pino &amp; Christian Reilly" text="The MMT Podcast offers economic analysis on current issues from a Modern Monetary Theory perspective. Aimed at anyone who has ever felt lost in the jargon used by mainstream economics commentators. We believe economics is for everyone.
-
-You can help sustain this podcast via Patreon: https://www.patreon.com/MMTpodcast" xmlUrl="https://pileusmmt.libsyn.com/rss" type="rss"/>
-        <outline title="The BradCast w/ Brad Friedman" text="Independent investigative journalism, broadcasting, trouble-making and muckraking with Brad Friedman of BradBlog.com. Originating on Pacifica Radio's KPFK 90.7FM in Los Angeles and syndicated daily coast-to-coast and around the globe!" xmlUrl="https://bradblog.com/podcastgen/bradcast/feed.xml" type="rss"/>
-        <outline title="Late Night Linux Family All Episodes" text="All episodes from Late Night Linux, Linux Dev Time, Linux After Dark, 2.5 Admins, Hybrid Cloud Show, and Ask The Hosts." xmlUrl="https://latenightlinux.com/feed/all" type="rss"/>
-        <outline title="Linux in the Ham Shack" text="Linux in the Ham Shack Podcast in MP3 Format" xmlUrl="https://lhspodcast.info/index.xml" type="rss"/>
-        <outline title="EFFector" text="Stay on the cutting edge of digital rights news with EFFector, the Electronic Frontier Foundation's bi-weekly podcast. Each episode features EFF's lawyers, activists, and technologists breaking down our latest work to defend your privacy and free speech online. The EFFector podcast is the audio companion to our email newsletter—subscribe at eff.org/effector." xmlUrl="https://feeds.eff.org/effector" type="rss"/>
-        <outline title="Clarkesworld Magazine" text="Science fiction and fantasy stories from Clarkesworld Magazine" xmlUrl="https://clarkesworldmagazine.com/?feed=podcast" type="rss"/>
-    </body>
+  <head>
+    <title>Radio show subscriptions</title>
+    <dateCreated>Tue, 17 Nov 2026 12:32:30 -0800</dateCreated>
+  </head>
+  <body>
+    <outline type="rss" text="12 Byzantine Rulers: The History of The Byzantine Empire" title="12 Byzantine Rulers: The History of The Byzantine Empire" xmlUrl="https://12byzantinerulers.com/rss.xml"/>
+    <outline type="rss" text="21st Century Wire" title="21st Century Wire" xmlUrl="https://sundaywire.libsyn.com/rss"/>
+    <outline type="rss" text="2 Skeptical Chaps" title="2 Skeptical Chaps" xmlUrl="https://2skepticalchaps.libsyn.com/rss"/>
+    <outline type="rss" text="Alternative Visions" title="Alternative Visions" xmlUrl="http://alternativevisions.podbean.com/feed/"/>
+    <outline type="rss" text="Ashes Ashes" title="Ashes Ashes" xmlUrl="https://pinecast.com/feed/ashes-ashes"/>
+    <outline type="rss" text="Citizen Radio" title="Citizen Radio" xmlUrl="http://feeds.feedburner.com/CitizenRadio"/>
+    <outline type="rss" text="Clarkesworld Magazine" title="Clarkesworld Magazine" xmlUrl="https://clarkesworldmagazine.com/?feed=podcast"/>
+    <outline type="rss" text="Clearing the FOG with co-hosts Margaret Flowers and Kevin Zeese" title="Clearing the FOG with co-hosts Margaret Flowers and Kevin Zeese" xmlUrl="https://clearingthefogradioshow.libsyn.com/rss"/>
+    <outline type="rss" text="Common Censored" title="Common Censored" xmlUrl="https://commoncensored.libsyn.com/rss"/>
+    <outline type="rss" text="Conservation news" title="Conservation news" xmlUrl="https://mongabay.libsyn.com/rss"/>
+    <outline type="rss" text="CounterSpin" title="CounterSpin" xmlUrl="https://fair.org/feed/podcast/"/>
+    <outline type="rss" text="Crazy Town" title="Crazy Town" xmlUrl="https://feeds.captivate.fm/crazy-town/"/>
+    <outline type="rss" text="Demand Utopia: A Solarpunk Podcast" title="Demand Utopia: A Solarpunk Podcast" xmlUrl="https://feeds.acast.com/public/shows/613e574e4a3f860012a4e22d"/>
+    <outline type="rss" text="Destination Linux" title="Destination Linux" xmlUrl="https://podcast.destinationlinux.org/rss"/>
+    <outline type="rss" text="EFFector" title="EFFector" xmlUrl="https://feeds.eff.org/effector"/>
+    <outline type="rss" text="Escape Pod" title="Escape Pod" xmlUrl="https://escapepod.org/feed/"/>
+    <outline type="rss" text="Extinction Rebellion Podcast" title="Extinction Rebellion Podcast" xmlUrl="https://xr-podcast.podomatic.com/rss2.xml"/>
+    <outline type="rss" text="Eyes Left Podcast" title="Eyes Left Podcast" xmlUrl="https://anchor.fm/s/553460c/podcast/rss"/>
+    <outline type="rss" text="From What If to What Next" title="From What If to What Next" xmlUrl="https://feeds.libsyn.com/279416/rss"/>
+    <outline type="rss" text="History of Philosophy: India, Africana, China" title="History of Philosophy: India, Africana, China" xmlUrl="https://hopwag2.podbean.com/feed/"/>
+    <outline type="rss" text="History of Philosophy Without Any Gaps" title="History of Philosophy Without Any Gaps" xmlUrl="http://hopwag.podbean.com/feed"/>
+    <outline type="rss" text="Jacobin Radio" title="Jacobin Radio" xmlUrl="https://pinecast.com/feed/jacobin"/>
+    <outline type="rss" text="Keeping Democracy Alive with Burt Cohen" title="Keeping Democracy Alive with Burt Cohen" xmlUrl="http://feeds2.feedburner.com/BurtCohen"/>
+    <outline type="rss" text="Late Night Linux All Episodes" title="Late Night Linux All Episodes" xmlUrl="https://latenightlinux.com/feed/all"/>
+    <outline type="rss" text="Linux in the Ham Shack" title="Linux in the Ham Shack" xmlUrl="https://lhspodcast.info/index.xml"/>
+    <outline type="rss" text="Long Now" title="Long Now" xmlUrl="https://longnow.org/podcast.xml"/>
+    <outline type="rss" text="Money on the Left" title="Money on the Left" xmlUrl="https://rss.buzzsprout.com/172776.rss"/>
+    <outline type="rss" text="Norman Centuries | A Norman History Podcast by Lars Brownworth" title="Norman Centuries | A Norman History Podcast by Lars Brownworth" xmlUrl="https://normancenturies.com/rss.xml"/>
+    <outline type="rss" text="Open Source with Christopher Lydon" title="Open Source with Christopher Lydon" xmlUrl="https://radioopensource.org/feed/"/>
+    <outline type="rss" text="Ralph Nader Radio Hour" title="Ralph Nader Radio Hour" xmlUrl="https://api.substack.com/feed/podcast/1047405.rss"/>
+    <outline type="rss" text="Revolutionary Left Radio" title="Revolutionary Left Radio" xmlUrl="https://revolutionaryleftradio.libsyn.com/rss"/>
+    <outline type="rss" text="Revolutions" title="Revolutions" xmlUrl="https://revolutionspodcast.libsyn.com/rss"/>
+    <outline type="rss" text="Solarpunk Presents" title="Solarpunk Presents" xmlUrl="https://feeds.acast.com/public/shows/solarpunk-presents"/>
+    <outline type="rss" text="Sustainability Solved" title="Sustainability Solved" xmlUrl="https://feeds.captivate.fm/sustainabilitysolvedpodcast/"/>
+    <outline type="rss" text="The BradCast w/ Brad Friedman" title="The BradCast w/ Brad Friedman" xmlUrl="https://bradblog.com/podcastgen/bradcast/feed.xml"/>
+    <outline type="rss" text="The British History Podcast" title="The British History Podcast" xmlUrl="https://feeds.feedburner.com/TheBritishHistoryPodcast"/>
+    <outline type="rss" text="The Energy Gang" title="The Energy Gang" xmlUrl="https://rss.art19.com/the-energy-gang"/>
+    <outline type="rss" text="The Energy Transition Show with Chris Nelder" title="The Energy Transition Show with Chris Nelder" xmlUrl="https://xenetwork.org/ets/feed/podcast"/>
+    <outline type="rss" text="The Final Straw Radio" title="The Final Straw Radio" xmlUrl="https://thefinalstrawradio.libsyn.com/rss"/>
+    <outline type="rss" text="The FRONTLINE Dispatch" title="The FRONTLINE Dispatch" xmlUrl="http://feeds.feedburner.com/TheFrontlineDispatch"/>
+    <outline type="rss" text="The History of Rome" title="The History of Rome" xmlUrl="http://feeds.feedburner.com/TheHistoryOfRome"/>
+    <outline type="rss" text="The MMT Podcast with Patricia Pino &amp; Christian Reilly" title="The MMT Podcast with Patricia Pino &amp; Christian Reilly" xmlUrl="https://pileusmmt.libsyn.com/rss"/>
+    <outline type="rss" text="Thinking Allowed" title="Thinking Allowed" xmlUrl="http://podcasts.files.bbci.co.uk/b006qy05.rss"/>
+    <outline type="rss" text="Volts" title="Volts" xmlUrl="https://api.substack.com/feed/podcast/193024.rss"/>
+  </body>
 </opml>

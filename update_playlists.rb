@@ -4,6 +4,8 @@
 require 'sequel'
 require 'json'
 require 'digest/sha1'
+require 'cgi'
+require 'time'
 
 SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
 CONFIG_PATH = File.join(SCRIPT_DIR, "config.json")
@@ -251,6 +253,50 @@ def cmd_set_limit(target, raw)
   true
 end
 
+# --export <file.opml>: write every registered show as a standard OPML 2.0
+# subscription list, ordered by slug. The outline format is the one gPodder
+# and fetch_podcasts.rb --import-opml read: type="rss" with text, title, and
+# xmlUrl, so an export re-imports without surprises. Titles and feed URLs
+# are XML-attribute-escaped (CGI.escapeHTML covers &, <, >, and quotes).
+# Returns true when the file was written.
+def cmd_export(path)
+  unless path
+    log("ERROR: Usage: update_playlists.rb --export <file.opml>")
+    return false
+  end
+
+  shows = $db_s[:shows].order(:slug).all
+  if shows.empty?
+    log("ERROR: No shows registered, nothing to export")
+    return false
+  end
+
+  begin
+    File.open(path, "w") do |f|
+      f.puts('<?xml version="1.0" encoding="UTF-8"?>')
+      f.puts('<opml version="2.0">')
+      f.puts('  <head>')
+      f.puts('    <title>Radio show subscriptions</title>')
+      f.puts("    <dateCreated>#{Time.now.rfc2822}</dateCreated>")
+      f.puts('  </head>')
+      f.puts('  <body>')
+      shows.each do |show|
+        title = CGI.escapeHTML(show[:title].to_s)
+        url = CGI.escapeHTML(show[:feed_url].to_s)
+        f.puts("    <outline type=\"rss\" text=\"#{title}\" title=\"#{title}\" xmlUrl=\"#{url}\"/>")
+      end
+      f.puts('  </body>')
+      f.puts('</opml>')
+    end
+  rescue Exception => the_error
+    log("ERROR: could not write #{path}: #{the_error.class}: #{the_error.message}")
+    return false
+  end
+
+  log("Exported #{shows.length} shows to #{path}")
+  true
+end
+
 def write_queue_file(filename, uris)
   path = File.join(QUEUE_DIR, filename)
   File.open(path, 'w') do |f|
@@ -344,6 +390,15 @@ def main
   if ARGV.include?("--set-limit")
     idx = ARGV.index("--set-limit")
     ok = cmd_set_limit(ARGV[idx + 1], ARGV[idx + 2])
+    exit(ok ? 0 : 1)
+  end
+
+  # --export <file.opml>: write every registered show as a standard OPML 2.0
+  # subscription list and exit. Exit status 0 on success, 1 on any failure,
+  # matching --set-limit's convention so shell chains can detect errors.
+  if ARGV.include?("--export")
+    idx = ARGV.index("--export")
+    ok = cmd_export(ARGV[idx + 1])
     exit(ok ? 0 : 1)
   end
 
